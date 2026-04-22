@@ -1,0 +1,51 @@
+{
+  "displayName": "Homebridge Composite Sensor",
+  "name": "homebridge-composite-sensor",
+  "type": "module",
+  "version": "0.1.0",
+  "description": "Composite Homebridge sensors derived from other accessories' states via MQTT and HAP",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/GlitchVector/homebridge-composite-sensor.git"
+  },
+  "bugs": {
+    "url": "https://github.com/GlitchVector/homebridge-composite-sensor/issues"
+  },
+  "engines": {
+    "node": "^18.20.4 || ^20.12.2 || ^20.18.0 || ^22.10.0",
+    "homebridge": "^1.8.0 || ^2.0.0-beta.0"
+  },
+  "main": "dist/index.js",
+  "scripts": {
+    "lint": "eslint src/**/*.ts --max-warnings=0",
+    "lint:fix": "eslint src/**/*.ts --fix",
+    "watch": "npm run build && npm link && nodemon",
+    "build": "rimraf ./dist && tsc",
+    "prepublishOnly": "npm run lint && npm run build"
+  },
+  "keywords": [
+    "homebridge-plugin",
+    "composite",
+    "sensor",
+    "motion",
+    "mqtt",
+    "hap"
+  ],
+  "dependencies": {
+    "@oznu/hap-client": "^1.9.0",
+    "mqtt": "^5.10.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.20.0",
+    "@types/eslint__js": "^8.42.3",
+    "@types/node": "^22.13.4",
+    "eslint": "^9.20.1",
+    "homebridge": "^2.0.0-beta.0",
+    "nodemon": "^3.1.9",
+    "rimraf": "^6.0.1",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.3",
+    "typescript-eslint": "^8.24.0"
+  }
+}

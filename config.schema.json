@@ -1,0 +1,130 @@
+{
+  "pluginAlias": "CompositeSensor",
+  "pluginType": "platform",
+  "singular": true,
+  "headerDisplay": "Composite sensors derived from other Homebridge accessories via MQTT and HAP.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "title": "Platform name",
+        "type": "string",
+        "default": "CompositeSensor",
+        "required": true
+      },
+      "mqtt": {
+        "title": "MQTT broker",
+        "type": "object",
+        "properties": {
+          "url": { "title": "URL", "type": "string", "placeholder": "mqtt://192.168.1.10:1883" },
+          "username": { "title": "Username", "type": "string" },
+          "password": { "title": "Password", "type": "string" },
+          "clientId": { "title": "Client ID (optional)", "type": "string" }
+        }
+      },
+      "hapBridges": {
+        "title": "HAP bridges (other Homebridge / child-bridge pairings)",
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "name": { "title": "Logical name", "type": "string", "required": true },
+            "port": { "title": "Port", "type": "integer", "required": true },
+            "pin": { "title": "Pairing PIN (xxx-xx-xxx)", "type": "string", "required": true },
+            "host": { "title": "Host (optional sanity check)", "type": "string" }
+          }
+        }
+      },
+      "sources": {
+        "title": "Sources",
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "name": { "title": "Name (referenced in expressions)", "type": "string", "required": true },
+            "type": {
+              "title": "Type",
+              "type": "string",
+              "required": true,
+              "oneOf": [
+                { "title": "MQTT", "enum": ["mqtt"] },
+                { "title": "HAP", "enum": ["hap"] }
+              ]
+            },
+            "topic": {
+              "title": "MQTT topic",
+              "type": "string",
+              "condition": { "functionBody": "return model.sources && model.sources[arrayIndices[0]] && model.sources[arrayIndices[0]].type === 'mqtt';" }
+            },
+            "map": {
+              "title": "MQTT map expression",
+              "type": "string",
+              "placeholder": "payload.occupancy",
+              "description": "JS expression over `payload` (parsed JSON) and `raw` (string) that coerces to a boolean.",
+              "condition": { "functionBody": "return model.sources && model.sources[arrayIndices[0]] && model.sources[arrayIndices[0]].type === 'mqtt';" }
+            },
+            "bridge": {
+              "title": "HAP bridge name",
+              "type": "string",
+              "condition": { "functionBody": "return model.sources && model.sources[arrayIndices[0]] && model.sources[arrayIndices[0]].type === 'hap';" }
+            },
+            "accessory": {
+              "title": "Accessory name or AID",
+              "type": "string",
+              "condition": { "functionBody": "return model.sources && model.sources[arrayIndices[0]] && model.sources[arrayIndices[0]].type === 'hap';" }
+            },
+            "characteristic": {
+              "title": "Characteristic (e.g. On, MotionDetected) or IID",
+              "type": "string",
+              "condition": { "functionBody": "return model.sources && model.sources[arrayIndices[0]] && model.sources[arrayIndices[0]].type === 'hap';" }
+            }
+          }
+        }
+      },
+      "sensors": {
+        "title": "Composite sensors",
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "name": { "title": "Name (shown in Home app)", "type": "string", "required": true },
+            "service": {
+              "title": "Service type",
+              "type": "string",
+              "required": true,
+              "default": "motion",
+              "oneOf": [
+                { "title": "Motion", "enum": ["motion"] },
+                { "title": "Occupancy", "enum": ["occupancy"] },
+                { "title": "Contact", "enum": ["contact"] }
+              ]
+            },
+            "expression": {
+              "title": "Expression",
+              "type": "string",
+              "required": true,
+              "placeholder": "phoneHome OR kitchenMotion",
+              "description": "Boolean expression over source names. Supports AND, OR, NOT, parentheses."
+            },
+            "holdSeconds": {
+              "title": "Hold seconds on true→false",
+              "type": "integer",
+              "default": 0,
+              "minimum": 0
+            },
+            "onDegraded": {
+              "title": "Behavior when a source is degraded",
+              "type": "string",
+              "default": "false",
+              "oneOf": [
+                { "title": "Emit false", "enum": ["false"] },
+                { "title": "Emit true", "enum": ["true"] },
+                { "title": "Last known", "enum": ["lastKnown"] }
+              ]
+            }
+          }
+        }
+      }
+    }
+  }
+}
