@@ -78,9 +78,9 @@ export class CompositeSensorPlatform implements DynamicPlatformPlugin {
 
     // --- HAP bridges ---
     for (const bridgeConfig of this.config.hapBridges ?? []) {
-      if (!bridgeConfig.name || !bridgeConfig.port || !bridgeConfig.pin) {
+      if (!bridgeConfig.name || !bridgeConfig.host || !bridgeConfig.port || !bridgeConfig.pin) {
         this.log.error(
-          `hapBridges entry missing required fields (name/port/pin): ${JSON.stringify(bridgeConfig)}`,
+          `hapBridges entry missing required fields (name/host/port/pin): ${JSON.stringify(bridgeConfig)}`,
         );
         continue;
       }

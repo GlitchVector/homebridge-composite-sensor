@@ -12,8 +12,10 @@ Config has four sections:
 
 - **`mqtt`** — a single broker connection, shared by all MQTT sources.
 - **`hapBridges`** — one entry per Homebridge (child bridge) you want to read
-  from, each with its own pairing PIN. Discovery is via mDNS; the `port` field
-  disambiguates which bridge to bind to.
+  from. Connection is **direct via `host:port`** (not mDNS) so the plugin
+  works on multi-interface hosts like QNAP where service advertisements on
+  each network bridge confuse discovery libraries. Use `127.0.0.1` when the
+  target bridge is in the same Homebridge container as this plugin.
 - **`sources`** — first-class named boolean signals. Each source has a `type`
   (`mqtt` or `hap`) and the details needed to resolve a stream of values into
   a boolean.
@@ -29,7 +31,7 @@ Config has four sections:
   "platform": "CompositeSensor",
   "mqtt": { "url": "mqtt://192.168.1.10:1883", "username": "hb", "password": "…" },
   "hapBridges": [
-    { "name": "hue", "port": 51827, "pin": "031-45-154" }
+    { "name": "hue", "host": "127.0.0.1", "port": 51827, "pin": "031-45-154" }
   ],
   "sources": [
     { "name": "kitchenMotion", "type": "mqtt", "topic": "zigbee2mqtt/kitchen_motion", "map": "payload.occupancy" },

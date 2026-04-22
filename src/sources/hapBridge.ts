@@ -6,12 +6,12 @@ import { EventEmitter } from "events";
 export interface HapBridgeConfig {
   /** Logical name used by sources via the `bridge` field. */
   name: string;
-  /** Expected port of the target Homebridge instance (used to filter mDNS). */
+  /** Host of the target Homebridge — typically 127.0.0.1 when running in the same container. */
+  host: string;
+  /** HAP port of the target Homebridge instance. */
   port: number;
   /** Pairing PIN — format `xxx-xx-xxx`. */
   pin: string;
-  /** Optional host — only used as a sanity check against discovered instances. */
-  host?: string;
 }
 
 /**
@@ -71,14 +71,21 @@ function matchesCharacteristicName(type: string, name: string | number): boolean
  * Wraps one `@oznu/hap-client` instance targeted at a single Homebridge
  * bridge / child bridge.
  *
- *  - Discovery is mDNS-based; we filter to the instance that matches the
- *    configured `port` (and optionally warn if `host` disagrees).
- *  - On first successful discovery we log a snapshot of all accessories
- *    with their AID/IID so users can switch from name- to ID-based
- *    targeting after renaming in the Home app.
- *  - Characteristic subscriptions are registered eagerly via
- *    `subscribe(matcher, listener)` and are resolved to concrete
- *    `{aid, iid}` pairs once discovery completes.
+ * Connection is **direct via `host:port`** — we don't rely on the library's
+ * built-in mDNS discovery because on multi-interface hosts (QNAP with
+ * macvlan-shim + qvs0 + lxcbr0 + docker0 + multiple bridges all advertising
+ * the same services) the library picks the first IPv4 from each device's
+ * address list and gives up if that IP isn't reachable, producing a
+ * non-deterministic pass/fail on every container restart. Instead we seed
+ * `client.instances` manually after construction and let the client's own
+ * HTTP machinery handle the rest.
+ *
+ * On first successful fetch we log a snapshot of all accessories with their
+ * AID/IID so users can switch from name- to ID-based targeting after
+ * renaming in the Home app.
+ *
+ * Characteristic subscriptions are registered eagerly via
+ * `subscribe(matcher, listener)` and are resolved once the catalog loads.
  */
 export class HapBridge extends EventEmitter {
   private client?: HapClient;
@@ -108,7 +115,7 @@ export class HapBridge extends EventEmitter {
       return;
     }
     this.log.info(
-      `HAP bridge "${this.config.name}" starting discovery for port ${this.config.port}`,
+      `HAP bridge "${this.config.name}" connecting directly to ${this.config.host}:${this.config.port}`,
     );
 
     const client = new HapClient({
@@ -123,23 +130,9 @@ export class HapBridge extends EventEmitter {
     });
     this.client = client;
 
-    client.on("instance-discovered", (instance: { port?: number; ipAddress?: string | null; name?: string }) => {
-      if (instance.port !== this.config.port) {
-        return;
-      }
-      if (this.config.host && instance.ipAddress && instance.ipAddress !== this.config.host) {
-        this.log.warn(
-          `HAP bridge "${this.config.name}" discovered at ${instance.ipAddress}:${instance.port} ` +
-            `but config.host is ${this.config.host} — using discovered host`,
-        );
-      }
-      this.log.info(
-        `HAP bridge "${this.config.name}" discovered at ${instance.ipAddress}:${instance.port}`,
-      );
-    });
-
-    // Startup is non-blocking: discovery + initial fetch happen in the background
-    // so Homebridge startup is never held up.
+    // Startup is non-blocking: the initial fetch happens in the background
+    // so Homebridge startup is never held up. bootstrap() seeds the client's
+    // instance pool on each attempt, bypassing mDNS entirely.
     void this.bootstrap();
   }
 
@@ -163,49 +156,47 @@ export class HapBridge extends EventEmitter {
   }
 
   private async bootstrap(): Promise<void> {
-    try {
-      // Discovery may take a moment; give it a beat before the first fetch.
-      await this.waitForInstance(30_000);
-      await this.refreshAccessories();
-    } catch (err) {
-      this.log.warn(
-        `HAP bridge "${this.config.name}" initial bootstrap failed:`,
-        (err as Error).message,
-      );
-      this.markAllDegraded();
+    // Retry with exponential backoff on connection failures so a temporarily
+    // unreachable child bridge (e.g. still booting) doesn't leave us stuck
+    // in degraded state forever.
+    let attempt = 0;
+    while (!this.stopped) {
+      try {
+        this.reseedInstance();
+        await this.refreshAccessories();
+        return;
+      } catch (err) {
+        this.log.warn(
+          `HAP bridge "${this.config.name}" bootstrap attempt ${attempt + 1} failed:`,
+          (err as Error).message,
+        );
+        this.markAllDegraded();
+        const delay = Math.min(60_000, 1000 * Math.pow(2, attempt));
+        attempt++;
+        await new Promise((r) => setTimeout(r, delay));
+      }
     }
   }
 
-  private waitForInstance(timeoutMs: number): Promise<void> {
-    return new Promise((resolve, reject) => {
-      if (!this.client) {
-        reject(new Error("client destroyed"));
-        return;
-      }
-      const client = this.client;
-      const expectedPort = this.config.port;
-      const state: { done: boolean; timer?: NodeJS.Timeout } = { done: false };
-      const onDiscovered = (instance: { port?: number }) => {
-        if (state.done || instance.port !== expectedPort) {
-          return;
-        }
-        state.done = true;
-        if (state.timer) {
-          clearTimeout(state.timer);
-        }
-        client.removeListener("instance-discovered", onDiscovered);
-        resolve();
-      };
-      client.on("instance-discovered", onDiscovered);
-      state.timer = setTimeout(() => {
-        if (state.done) {
-          return;
-        }
-        state.done = true;
-        client.removeListener("instance-discovered", onDiscovered);
-        reject(new Error(`no HAP instance on port ${expectedPort} within ${timeoutMs}ms`));
-      }, timeoutMs);
-    });
+  /**
+   * Re-seed the single instance into `client.instances`. hap-client removes
+   * instances that fail 5+ times in a row; on retry we need to put ours
+   * back so the next HTTP request has a target.
+   */
+  private reseedInstance(): void {
+    const client = this.client;
+    if (!client) {
+      return;
+    }
+    const instance = {
+      name: this.config.name,
+      ipAddress: this.config.host,
+      port: this.config.port,
+      username: `${this.config.host}:${this.config.port}`,
+      services: [],
+      connectionFailedCount: 0,
+    };
+    (client as unknown as { instances: unknown[] }).instances = [instance];
   }
 
   private async refreshAccessories(): Promise<void> {

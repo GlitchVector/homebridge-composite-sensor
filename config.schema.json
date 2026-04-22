@@ -29,9 +29,10 @@
           "type": "object",
           "properties": {
             "name": { "title": "Logical name", "type": "string", "required": true },
-            "port": { "title": "Port", "type": "integer", "required": true },
-            "pin": { "title": "Pairing PIN (xxx-xx-xxx)", "type": "string", "required": true },
-            "host": { "title": "Host (optional sanity check)", "type": "string" }
+            "host": { "title": "Host (use 127.0.0.1 for a bridge on the same Homebridge container)",
+                      "type": "string", "required": true, "default": "127.0.0.1" },
+            "port": { "title": "HAP port", "type": "integer", "required": true },
+            "pin": { "title": "Pairing PIN (xxx-xx-xxx)", "type": "string", "required": true }
           }
         }
       },
