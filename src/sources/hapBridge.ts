@@ -118,13 +118,19 @@ export class HapBridge extends EventEmitter {
       `HAP bridge "${this.config.name}" connecting directly to ${this.config.host}:${this.config.port}`,
     );
 
+    // hap-client's debug() method calls `logger.log` — not `logger.debug` —
+    // so the adapter must expose `log`. It silently crashes the async
+    // discovery callback otherwise (only visible in stderr as a
+    // TypeError stack trace).
+    const logFn = (...a: unknown[]) => this.log.debug(`[hap:${this.config.name}]`, ...a);
     const client = new HapClient({
       pin: this.config.pin,
       logger: {
-        info: (...a: unknown[]) => this.log.debug(`[hap:${this.config.name}]`, ...a),
+        log: logFn,
+        info: logFn,
         warn: (...a: unknown[]) => this.log.warn(`[hap:${this.config.name}]`, ...a),
         error: (...a: unknown[]) => this.log.error(`[hap:${this.config.name}]`, ...a),
-        debug: (...a: unknown[]) => this.log.debug(`[hap:${this.config.name}]`, ...a),
+        debug: logFn,
       },
       config: { debug: false },
     });
@@ -204,8 +210,19 @@ export class HapBridge extends EventEmitter {
     if (!client) {
       return;
     }
-    const services = (await client.getAllServices()) as unknown as HapService[];
-    this.onServices(services);
+    const all = (await client.getAllServices()) as unknown as HapService[];
+    // hap-client's getAccessories() swallows axios errors and returns an
+    // empty list, so an ECONNREFUSED during a child-bridge startup race
+    // looks the same as "no accessories". Treat an empty result as a
+    // connection failure so bootstrap() retries with backoff. A real empty
+    // bridge is edge-case enough that the retry is harmless.
+    const matching = all.filter((svc) => svc.instance?.port === this.config.port);
+    if (matching.length === 0) {
+      throw new Error(
+        `no accessories returned from ${this.config.host}:${this.config.port} (likely ECONNREFUSED / bridge not yet ready)`,
+      );
+    }
+    this.onServices(all);
     // Start monitoring after we have the service catalog. `service-update`
     // events are emitted by the monitor — not the client.
     if (!this.monitor) {
