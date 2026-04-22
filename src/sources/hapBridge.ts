@@ -226,11 +226,17 @@ export class HapBridge extends EventEmitter {
   }
 
   private onServices(services: HapService[]): void {
-    this.services = services;
+    // `@oznu/hap-client` shares a single HapClient across all HAP instances
+    // it paired with the configured PIN. On Homebridge's default "same PIN
+    // for all child bridges" setup, that means getAllServices() / the
+    // monitor return services from every paired bridge. Filter to only our
+    // target bridge's port so matching, snapshot, and fan-out are scoped.
+    const filtered = services.filter((svc) => svc.instance?.port === this.config.port);
+    this.services = filtered;
     this.discovered = true;
 
     if (!this.snapshotLogged) {
-      this.logSnapshot(services);
+      this.logSnapshot(filtered);
       this.snapshotLogged = true;
     }
 
@@ -242,7 +248,7 @@ export class HapBridge extends EventEmitter {
     }
 
     // Fan out current values to all resolved listeners.
-    for (const svc of services) {
+    for (const svc of filtered) {
       for (const ch of svc.serviceCharacteristics) {
         this.dispatch(svc.aid, ch.iid, ch.value, false);
       }

@@ -211,6 +211,6 @@ export class CompositeSensor {
   private setValue(v: boolean): void {
     this.currentValue = v;
     this.service.updateCharacteristic(this.primaryCharacteristic, v);
-    this.platform.log.debug(`Sensor "${this.config.name}" -> ${v}`);
+    this.platform.log.info(`Sensor "${this.config.name}" -> ${v}`);
   }
 }
