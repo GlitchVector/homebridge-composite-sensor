@@ -50,18 +50,41 @@ function matchesCharacteristicName(type: string, name: string | number): boolean
   return type.toUpperCase() === short || type.toUpperCase().startsWith(`000000${short}-`);
 }
 
-function shortOrLong(uuid: string | undefined, fallback: string): string {
-  if (!uuid) {
-    return fallback;
+/**
+ * hap-controller's `serviceFromUuid` / `characteristicFromUuid` return the
+ * **dotted** IANA-ish form (e.g. `"public.hap.service.accessory-information"`,
+ * `"public.hap.characteristic.name"`), NOT the short PascalCase form. These
+ * helpers normalize to that dotted form for stable string comparisons.
+ */
+function serviceTypeName(type: string | undefined): string {
+  if (!type) {
+    return "";
   }
   try {
-    const long = HapCharacteristic_.ensureCharacteristicUuid(uuid);
-    const name = HapCharacteristic_.characteristicFromUuid(long);
-    return name || fallback;
+    return HapService_.serviceFromUuid(HapService_.ensureServiceUuid(type)) || "";
   } catch {
-    return fallback;
+    return "";
   }
 }
+
+function charTypeName(type: string | undefined): string {
+  if (!type) {
+    return "";
+  }
+  try {
+    return (
+      HapCharacteristic_.characteristicFromUuid(
+        HapCharacteristic_.ensureCharacteristicUuid(type),
+      ) || ""
+    );
+  } catch {
+    return "";
+  }
+}
+
+const SERVICE_ACCESSORY_INFORMATION = "public.hap.service.accessory-information";
+const CHAR_NAME = "public.hap.characteristic.name";
+const CHAR_CONFIGURED_NAME = "public.hap.characteristic.configured-name";
 
 /**
  * Wraps one HAP accessory connection via `hap-controller`.
@@ -93,6 +116,11 @@ export class NativeHapBridge extends EventEmitter {
   private snapshotLogged = false;
   private stopped = false;
   private subscribedKeys = new Set<string>();
+  /** Long-lived mDNS watcher for c# (config number) bumps. */
+  private watchDiscovery?: IPDiscovery;
+  /** Highest c# we've seen from mDNS; drives auto-reconcile. */
+  private lastConfigNumber?: number;
+  private reconcileInFlight = false;
 
   private readonly pendingSubscribers: Array<{
     matcher: CharacteristicMatcher;
@@ -121,6 +149,12 @@ export class NativeHapBridge extends EventEmitter {
 
   stop(): void {
     this.stopped = true;
+    try {
+      this.watchDiscovery?.stop();
+    } catch {
+      /* best-effort */
+    }
+    this.watchDiscovery = undefined;
     this.client?.close().catch(() => {
       /* best-effort */
     });
@@ -311,7 +345,110 @@ export class NativeHapBridge extends EventEmitter {
       void this.bootstrap();
     });
 
+    this.startConfigWatcher();
     void this.ensureSubscriptionsCurrent();
+  }
+
+  /**
+   * Watch mDNS for this accessory's `c#` (config number). It bumps whenever
+   * the accessory's database changes — e.g. zones added/removed in Aqara
+   * Home after initial pair. Without this watcher we'd serve stale AID/IID
+   * references until Homebridge is manually restarted.
+   */
+  private startConfigWatcher(): void {
+    if (this.watchDiscovery) {
+      return;
+    }
+    const disc = new IPDiscovery();
+    this.watchDiscovery = disc;
+
+    const onServiceRecord = (svc: HapServiceIp): void => {
+      if (svc.id !== this.deviceId) {
+        return;
+      }
+      const cnum = svc["c#"];
+      if (typeof cnum !== "number") {
+        return;
+      }
+      if (this.lastConfigNumber === undefined) {
+        this.lastConfigNumber = cnum;
+        return;
+      }
+      if (cnum <= this.lastConfigNumber) {
+        return;
+      }
+      this.log.info(
+        `HAP bridge "${this.config.name}" config number bumped ${this.lastConfigNumber} → ${cnum} — refreshing accessory catalog`,
+      );
+      this.lastConfigNumber = cnum;
+      // Track the new port too in case it rotated while we weren't looking.
+      this.currentPort = svc.port;
+      void this.reconcileCatalog();
+    };
+
+    disc.on("serviceUp", onServiceRecord);
+    disc.on("serviceChanged", onServiceRecord);
+    disc.start();
+  }
+
+  /**
+   * Re-fetch the accessory catalog and re-subscribe. Called when `c#` bumps.
+   * Drops old subscriptions first so iid shifts don't leave dangling watches.
+   */
+  private async reconcileCatalog(): Promise<void> {
+    if (this.reconcileInFlight || !this.client) {
+      return;
+    }
+    this.reconcileInFlight = true;
+    try {
+      // Drop prior subscriptions so we don't leave stale iid watches around.
+      try {
+        await this.client.unsubscribeCharacteristics();
+      } catch (err) {
+        this.log.debug(
+          `HAP bridge "${this.config.name}" unsubscribe-all during reconcile failed: ${(err as Error).message}`,
+        );
+      }
+      this.subscribedKeys.clear();
+
+      const data = await this.client.getAccessories();
+      const services = this.transformAccessories(data.accessories);
+
+      // Re-seed catalog + fan out current values to still-bound listeners.
+      // Preserve resolved bindings where the (aid, iid) pair still exists;
+      // drop ones whose iid was removed; leave new iids to be bound via
+      // future subscribe() calls (expression-referenced sources re-resolve
+      // on next platform restart anyway).
+      const stillPresent = new Set<string>();
+      for (const svc of services) {
+        for (const ch of svc.serviceCharacteristics) {
+          stillPresent.add(`${svc.aid}:${ch.iid}`);
+        }
+      }
+      for (const key of [...this.resolved.keys()]) {
+        if (!stillPresent.has(key)) {
+          const listeners = this.resolved.get(key) ?? [];
+          for (const l of listeners) {
+            l(undefined, true);
+          }
+          this.resolved.delete(key);
+        }
+      }
+      this.services = services;
+      // Force fresh fan-out of current values.
+      for (const svc of services) {
+        for (const ch of svc.serviceCharacteristics) {
+          this.dispatch(svc.aid, ch.iid, ch.value, false);
+        }
+      }
+      await this.ensureSubscriptionsCurrent();
+    } catch (err) {
+      this.log.warn(
+        `HAP bridge "${this.config.name}" reconcile failed: ${(err as Error).message}`,
+      );
+    } finally {
+      this.reconcileInFlight = false;
+    }
   }
 
   /**
@@ -355,12 +492,9 @@ export class NativeHapBridge extends EventEmitter {
       // Best-effort accessory-wide name from AccessoryInformation → Name.
       let accName: string | undefined;
       for (const svc of acc.services) {
-        const svcName = HapService_.serviceFromUuid(
-          HapService_.ensureServiceUuid(svc.type),
-        );
-        if (svcName === "AccessoryInformation") {
+        if (serviceTypeName(svc.type) === SERVICE_ACCESSORY_INFORMATION) {
           for (const ch of svc.characteristics) {
-            if (shortOrLong(ch.type, "") === "Name" && typeof ch.value === "string") {
+            if (charTypeName(ch.type) === CHAR_NAME && typeof ch.value === "string") {
               accName = ch.value;
             }
           }
@@ -371,8 +505,12 @@ export class NativeHapBridge extends EventEmitter {
         // on this service; fall back to the accessory-wide name.
         let serviceName = accName;
         for (const ch of svc.characteristics) {
-          const chName = shortOrLong(ch.type, "");
-          if ((chName === "Name" || chName === "ConfiguredName") && typeof ch.value === "string" && ch.value) {
+          const chName = charTypeName(ch.type);
+          if (
+            (chName === CHAR_NAME || chName === CHAR_CONFIGURED_NAME) &&
+            typeof ch.value === "string" &&
+            ch.value
+          ) {
             serviceName = ch.value;
           }
         }

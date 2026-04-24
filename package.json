@@ -2,7 +2,7 @@
   "displayName": "Homebridge Composite Sensor",
   "name": "homebridge-composite-sensor",
   "type": "module",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Composite Homebridge sensors derived from other accessories' states via MQTT and HAP",
   "license": "Apache-2.0",
   "repository": {
