@@ -9,6 +9,7 @@ import {
 } from "homebridge";
 
 import { PLATFORM_NAME, PLUGIN_NAME } from "./settings.js";
+import { patchDnssdReadFQDN } from "./sources/dnssdPatch.js";
 import { Source } from "./sources/source.js";
 import { MqttBroker, MqttConfig } from "./sources/mqttBroker.js";
 import { MqttSource, MqttSourceConfig } from "./sources/mqttSource.js";
@@ -43,6 +44,11 @@ export class CompositeSensorPlatform implements DynamicPlatformPlugin {
   ) {
     this.Service = api.hap.Service;
     this.Characteristic = api.hap.Characteristic;
+
+    patchDnssdReadFQDN({
+      info: (s) => this.log.info(s),
+      debug: (s) => this.log.debug(s),
+    });
 
     this.log.debug("Finished initializing platform:", this.config.name);
 
