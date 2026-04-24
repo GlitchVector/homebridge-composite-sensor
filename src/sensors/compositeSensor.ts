@@ -17,6 +17,29 @@ export interface CompositeSensorConfig {
   holdSeconds?: number;
   /** What to emit when any referenced source is degraded. Default "false". */
   onDegraded?: OnDegradedPolicy;
+  /**
+   * Latch-until-exit semantics.
+   *
+   * When set, the sensor will NOT flip from true to false unless the named
+   * source has had a true→false transition (a "falling edge") within the
+   * last `latchEdgeWindowSeconds` seconds. Useful for "somebody home"
+   * sensors where presence is OR'd across multiple detectors (FP2 zones,
+   * etc.) plus a door PIR — you want the sensor to stay `true` during
+   * periods of stillness (e.g. sleeping in a blind spot) and only release
+   * when the occupant has walked past the door PIR *and* all presence then
+   * clears.
+   *
+   * If the window has expired or the edge has never fired, the sensor
+   * stays latched `true` (no matter how long the expression has been
+   * `false`) until any presence signal returns — at which point the
+   * cycle resets.
+   *
+   * Combines with `holdSeconds`: after the edge requirement is satisfied,
+   * the normal hold-then-flip flow applies.
+   */
+  latchUntilEdgeOf?: string;
+  /** Default 300 (5 min). Only meaningful when `latchUntilEdgeOf` is set. */
+  latchEdgeWindowSeconds?: number;
 }
 
 /**
@@ -34,6 +57,8 @@ export class CompositeSensor {
   private readonly primaryCharacteristic: CharacteristicCtor;
   private readonly holdMs: number;
   private readonly onDegraded: OnDegradedPolicy;
+  private readonly latchSource?: Source;
+  private readonly latchWindowMs: number;
 
   /** The value currently reported to HomeKit. */
   private currentValue: boolean = false;
@@ -42,6 +67,8 @@ export class CompositeSensor {
   private hasSeenAnyValue = false;
   private pendingFalseTimer?: NodeJS.Timeout;
   private readonly changeListener: () => void;
+  /** Sources we subscribed to change events on (expression refs + optional latch source). */
+  private readonly subscribedSources: Source[] = [];
 
   constructor(
     private readonly platform: CompositeSensorPlatform,
@@ -53,6 +80,7 @@ export class CompositeSensor {
     this.referencedSources = collectIdentifiers(this.ast);
     this.holdMs = Math.max(0, (config.holdSeconds ?? 0) * 1000);
     this.onDegraded = config.onDegraded ?? "false";
+    this.latchWindowMs = Math.max(0, (config.latchEdgeWindowSeconds ?? 300) * 1000);
 
     for (const ref of this.referencedSources) {
       if (!sources.has(ref)) {
@@ -60,6 +88,16 @@ export class CompositeSensor {
           `Sensor "${config.name}" references unknown source "${ref}" in expression "${config.expression}"`,
         );
       }
+    }
+
+    if (config.latchUntilEdgeOf) {
+      const src = sources.get(config.latchUntilEdgeOf);
+      if (!src) {
+        throw new Error(
+          `Sensor "${config.name}" latchUntilEdgeOf references unknown source "${config.latchUntilEdgeOf}"`,
+        );
+      }
+      this.latchSource = src;
     }
 
     const info = accessory.getService(platform.Service.AccessoryInformation);
@@ -76,10 +114,19 @@ export class CompositeSensor {
       .getCharacteristic(characteristic)
       .onGet(() => this.currentValue as CharacteristicValue);
 
-    // Subscribe to source changes. Keep a reference so we can detach on stop().
+    // Subscribe to source changes. Keep references so we can detach on stop().
+    // Includes the latch source even if it's not in the expression — the
+    // sensor must re-evaluate when its falling edge happens so a stuck
+    // latch can release at the right moment.
     this.changeListener = () => this.recompute();
-    for (const ref of this.referencedSources) {
-      sources.get(ref)!.on("change", this.changeListener);
+    const subscribeNames = new Set<string>(this.referencedSources);
+    if (config.latchUntilEdgeOf) {
+      subscribeNames.add(config.latchUntilEdgeOf);
+    }
+    for (const name of subscribeNames) {
+      const src = sources.get(name)!;
+      src.on("change", this.changeListener);
+      this.subscribedSources.push(src);
     }
 
     this.recompute();
@@ -112,9 +159,10 @@ export class CompositeSensor {
   }
 
   stop(): void {
-    for (const ref of this.referencedSources) {
-      this.sources.get(ref)?.off("change", this.changeListener);
+    for (const src of this.subscribedSources) {
+      src.off("change", this.changeListener);
     }
+    this.subscribedSources.length = 0;
     if (this.pendingFalseTimer) {
       clearTimeout(this.pendingFalseTimer);
       this.pendingFalseTimer = undefined;
@@ -155,9 +203,34 @@ export class CompositeSensor {
   }
 
   /**
+   * Return true if the latch condition permits a true→false flip right now.
+   * Semantics: a flip is only allowed if the latch source has had a falling
+   * edge within the configured window. If no latch source is configured,
+   * always permits. Called twice — at the moment applyWithHold receives a
+   * false and again at the end of the holdSeconds timer — so a latch-expiry
+   * during the hold window correctly stops the flip.
+   */
+  private latchPermitsFlip(): boolean {
+    if (!this.latchSource) {
+      return true;
+    }
+    const edge = this.latchSource.lastFallingEdgeAt;
+    if (edge === undefined) {
+      return false;
+    }
+    return Date.now() - edge <= this.latchWindowMs;
+  }
+
+  /**
    * Hold semantics: false→true fires instantly; true→false is deferred for
    * `holdSeconds` and only fires if the expression is still false at the end.
    * A new `true` during the hold cancels the pending false.
+   *
+   * Latch semantics (when `latchUntilEdgeOf` is configured): a true→false
+   * flip is additionally gated on the latch source having had a recent
+   * falling edge. Without that, the sensor stays `true` indefinitely —
+   * suitable for "somebody home" where absence of presence ≠ absence
+   * from home (bedroom stillness, etc.).
    */
   private applyWithHold(next: boolean): void {
     if (next === this.currentValue) {
@@ -178,7 +251,16 @@ export class CompositeSensor {
       return;
     }
 
-    // next === false: defer if configured.
+    // next === false: latch veto takes priority over hold defer.
+    if (!this.latchPermitsFlip()) {
+      if (this.pendingFalseTimer) {
+        clearTimeout(this.pendingFalseTimer);
+        this.pendingFalseTimer = undefined;
+      }
+      return;
+    }
+
+    // defer if configured.
     if (this.holdMs === 0) {
       this.setValue(false);
       return;
@@ -202,7 +284,7 @@ export class CompositeSensor {
       const finalValue = (anyDegraded || evaluated === undefined)
         ? this.applyDegradedPolicy()
         : evaluated;
-      if (!finalValue) {
+      if (!finalValue && this.latchPermitsFlip()) {
         this.setValue(false);
       }
     }, this.holdMs);
