@@ -122,6 +122,18 @@
               "default": 0,
               "minimum": 0
             },
+            "latchUntilEdgeOf": {
+              "title": "Latch until falling edge of source (e.g. door PIR)",
+              "description": "When set, the sensor will not flip from true to false unless the named source has had a recent true→false transition. Use for 'somebody home' where presence OR'd across many detectors should stay true during stillness and only release on a confirmed exit via door PIR.",
+              "type": "string"
+            },
+            "latchEdgeWindowSeconds": {
+              "title": "Latch edge validity window (seconds)",
+              "description": "How recently the latch source must have had a falling edge for a flip to be permitted. Default 300 (5 min).",
+              "type": "integer",
+              "default": 300,
+              "minimum": 1
+            },
             "onDegraded": {
               "title": "Behavior when a source is degraded",
               "type": "string",
