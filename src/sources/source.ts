@@ -15,13 +15,6 @@ import { Logger } from "homebridge";
 export abstract class Source extends EventEmitter {
   public value: boolean | undefined = undefined;
   public degraded = true;
-  /**
-   * Monotonic `Date.now()` when this source last transitioned true→false
-   * (a "falling edge"). Undefined until the source has had such a
-   * transition. Consumed by composite sensors that latch on presence and
-   * only release on a recent exit-trigger edge.
-   */
-  public lastFallingEdgeAt: number | undefined;
 
   constructor(
     public readonly name: string,
@@ -34,11 +27,7 @@ export abstract class Source extends EventEmitter {
   abstract stop(): void;
 
   protected update(next: boolean | undefined, degraded: boolean): void {
-    const prev = this.value;
-    const changed = prev !== next || this.degraded !== degraded;
-    if (prev === true && next === false) {
-      this.lastFallingEdgeAt = Date.now();
-    }
+    const changed = this.value !== next || this.degraded !== degraded;
     this.value = next;
     this.degraded = degraded;
     if (changed) {
