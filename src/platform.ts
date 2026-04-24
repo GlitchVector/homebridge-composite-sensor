@@ -159,6 +159,18 @@ export class CompositeSensorPlatform implements DynamicPlatformPlugin {
     }
 
     // --- Kick off transports last so sensors are ready to receive events ---
+    // Start HAP bridges eagerly — even if no source currently references
+    // them. This guarantees the AID/IID snapshot is logged on first start
+    // (useful for discovering which zones/services an accessory exposes),
+    // and allows `subscribe()` calls that arrive later to resolve against
+    // an already-populated catalog.
+    for (const bridge of this.hapBridges.values()) {
+      try {
+        bridge.start();
+      } catch (err) {
+        this.log.error(`Failed to start HAP bridge "${bridge.config.name}":`, (err as Error).message);
+      }
+    }
     for (const source of this.sources.values()) {
       try {
         source.start();

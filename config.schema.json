@@ -32,7 +32,16 @@
             "host": { "title": "Host (use 127.0.0.1 for a bridge on the same Homebridge container)",
                       "type": "string", "required": true, "default": "127.0.0.1" },
             "port": { "title": "HAP port", "type": "integer", "required": true },
-            "pin": { "title": "Pairing PIN (xxx-xx-xxx)", "type": "string", "required": true }
+            "pin": { "title": "Pairing PIN (xxx-xx-xxx)", "type": "string", "required": true },
+            "mode": {
+              "title": "Transport mode",
+              "type": "string",
+              "default": "homebridge",
+              "oneOf": [
+                { "title": "Homebridge (PIN header shortcut — other Homebridge / child bridges)", "enum": ["homebridge"] },
+                { "title": "Native HAP (real pair-setup — native accessories like Aqara FP2)", "enum": ["native"] }
+              ]
+            }
           }
         }
       },
