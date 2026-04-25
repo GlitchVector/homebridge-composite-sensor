@@ -37,6 +37,7 @@ const SHORT_NAMES: Record<string, string> = {
   MotionDetected: "22",
   OccupancyDetected: "71",
   ContactSensorState: "6A",
+  CurrentAmbientLightLevel: "6B",
 };
 
 function matchesCharacteristicName(type: string, name: string | number): boolean {

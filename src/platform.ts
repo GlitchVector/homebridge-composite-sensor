@@ -16,14 +16,16 @@ import { MqttSource, MqttSourceConfig } from "./sources/mqttSource.js";
 import { HapBridge, HapBridgeConfig } from "./sources/hapBridge.js";
 import { HapSource, HapSourceConfig } from "./sources/hapSource.js";
 import { CompositeSensor, CompositeSensorConfig } from "./sensors/compositeSensor.js";
+import { LightSensor, LightSensorConfig } from "./sensors/lightSensor.js";
 
 type SourceConfig = MqttSourceConfig | HapSourceConfig;
+type SensorConfig = CompositeSensorConfig | LightSensorConfig;
 
 interface CompositeSensorPlatformConfig extends PlatformConfig {
   mqtt?: MqttConfig;
   hapBridges?: HapBridgeConfig[];
   sources?: SourceConfig[];
-  sensors?: CompositeSensorConfig[];
+  sensors?: SensorConfig[];
 }
 
 export class CompositeSensorPlatform implements DynamicPlatformPlugin {
@@ -35,7 +37,7 @@ export class CompositeSensorPlatform implements DynamicPlatformPlugin {
   private mqttBroker?: MqttBroker;
   private readonly hapBridges = new Map<string, HapBridge>();
   private readonly sources = new Map<string, Source>();
-  private readonly sensors: CompositeSensor[] = [];
+  private readonly sensors: Array<{ stop(): void }> = [];
 
   constructor(
     public readonly log: Logger,
@@ -129,9 +131,22 @@ export class CompositeSensorPlatform implements DynamicPlatformPlugin {
     // --- Sensors (accessories) ---
     const desiredUuids = new Set<string>();
     for (const sensorConfig of sensorConfigs) {
-      if (!sensorConfig.name || !sensorConfig.expression || !sensorConfig.service) {
+      if (!sensorConfig.name || !sensorConfig.service) {
         this.log.error(
-          `sensor entry missing required fields (name/service/expression): ${JSON.stringify(sensorConfig)}`,
+          `sensor entry missing required fields (name/service): ${JSON.stringify(sensorConfig)}`,
+        );
+        continue;
+      }
+      if (sensorConfig.service === "light") {
+        if (!sensorConfig.bridge || !sensorConfig.accessory || !sensorConfig.characteristic) {
+          this.log.error(
+            `light sensor "${sensorConfig.name}" missing required fields (bridge/accessory/characteristic)`,
+          );
+          continue;
+        }
+      } else if (!(sensorConfig as CompositeSensorConfig).expression) {
+        this.log.error(
+          `composite sensor "${sensorConfig.name}" missing required field: expression`,
         );
         continue;
       }
@@ -142,16 +157,21 @@ export class CompositeSensorPlatform implements DynamicPlatformPlugin {
       if (!accessory) {
         accessory = new this.api.platformAccessory(sensorConfig.name, uuid);
         this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
-        this.log.info(`Registered new composite sensor: ${sensorConfig.name}`);
+        this.log.info(`Registered new sensor: ${sensorConfig.name}`);
       } else {
         accessory.displayName = sensorConfig.name;
-        this.log.info(`Restored composite sensor from cache: ${sensorConfig.name}`);
+        this.log.info(`Restored sensor from cache: ${sensorConfig.name}`);
       }
       accessory.context.config = sensorConfig;
 
       try {
-        const sensor = new CompositeSensor(this, accessory, sensorConfig, this.sources);
-        this.sensors.push(sensor);
+        if (sensorConfig.service === "light") {
+          this.sensors.push(new LightSensor(this, accessory, sensorConfig, this.hapBridges));
+        } else {
+          this.sensors.push(
+            new CompositeSensor(this, accessory, sensorConfig as CompositeSensorConfig, this.sources),
+          );
+        }
       } catch (err) {
         this.log.error(`Failed to build sensor "${sensorConfig.name}":`, (err as Error).message);
       }

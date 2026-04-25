@@ -106,15 +106,34 @@
               "oneOf": [
                 { "title": "Motion", "enum": ["motion"] },
                 { "title": "Occupancy", "enum": ["occupancy"] },
-                { "title": "Contact", "enum": ["contact"] }
+                { "title": "Contact", "enum": ["contact"] },
+                { "title": "Light (numeric passthrough — single HAP characteristic → CurrentAmbientLightLevel)", "enum": ["light"] }
               ]
             },
             "expression": {
               "title": "Expression",
               "type": "string",
-              "required": true,
               "placeholder": "phoneHome OR kitchenMotion",
-              "description": "Boolean expression over source names. Supports AND, OR, NOT, parentheses."
+              "description": "Boolean expression over source names. Supports AND, OR, NOT, parentheses. Required for motion/occupancy/contact; ignored for light.",
+              "condition": { "functionBody": "return model.sensors && model.sensors[arrayIndices[0]] && model.sensors[arrayIndices[0]].service !== 'light';" }
+            },
+            "bridge": {
+              "title": "HAP bridge name",
+              "type": "string",
+              "description": "Light sensor only — the hapBridges entry to read from.",
+              "condition": { "functionBody": "return model.sensors && model.sensors[arrayIndices[0]] && model.sensors[arrayIndices[0]].service === 'light';" }
+            },
+            "accessory": {
+              "title": "Accessory name or AID",
+              "type": "string",
+              "description": "Light sensor only — accessory to read from on the chosen bridge.",
+              "condition": { "functionBody": "return model.sensors && model.sensors[arrayIndices[0]] && model.sensors[arrayIndices[0]].service === 'light';" }
+            },
+            "characteristic": {
+              "title": "Characteristic (e.g. CurrentAmbientLightLevel) or IID",
+              "type": "string",
+              "description": "Light sensor only — characteristic on the accessory to read.",
+              "condition": { "functionBody": "return model.sensors && model.sensors[arrayIndices[0]] && model.sensors[arrayIndices[0]].service === 'light';" }
             },
             "holdSeconds": {
               "title": "Hold seconds on true→false",
