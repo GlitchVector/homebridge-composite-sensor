@@ -67,6 +67,27 @@ type CharacteristicMatcher = {
 type Listener = (value: unknown, degraded: boolean) => void;
 
 /**
+ * JSON has no distinction between `1` and `"1"` once a config is round-tripped
+ * through the Homebridge Config-UI editor (which silently restringifies many
+ * numeric fields). Aid/iid values are always non-negative integers and never
+ * collide with characteristic names like "On" / "MotionDetected", so we can
+ * safely promote any all-digits string to its number form before the bridge
+ * impls' identity checks (`svc.aid === accIdent`, `ch.iid === chIdent`) run.
+ */
+function coerceIdent(value: string | number): string | number {
+  if (typeof value === "number") {
+    return value;
+  }
+  if (typeof value === "string" && /^\d+$/.test(value)) {
+    const n = Number(value);
+    if (Number.isFinite(n)) {
+      return n;
+    }
+  }
+  return value;
+}
+
+/**
  * Public facade. Construction selects the appropriate transport based on
  * `config.mode` (defaulting to the legacy homebridge-to-homebridge path).
  * Downstream code (`HapSource`, platform.ts) only knows about this class.
@@ -93,6 +114,12 @@ export class HapBridge extends EventEmitter {
   }
 
   subscribe(matcher: CharacteristicMatcher, listener: Listener): void {
-    this.impl.subscribe(matcher, listener);
+    this.impl.subscribe(
+      {
+        accessory: coerceIdent(matcher.accessory),
+        characteristic: coerceIdent(matcher.characteristic),
+      },
+      listener,
+    );
   }
 }
