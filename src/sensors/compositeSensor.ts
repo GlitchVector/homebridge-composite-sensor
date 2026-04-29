@@ -1,7 +1,16 @@
 import { PlatformAccessory, Service, CharacteristicValue, WithUUID, Characteristic } from "homebridge";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { Ast, evaluate, parseExpression, collectIdentifiers } from "../dsl/parser.js";
 import { Source } from "../sources/source.js";
 import { CompositeSensorPlatform } from "../platform.js";
+
+interface PersistedSensorState {
+  lastKnown: boolean;
+  hasSeenAnyValue: boolean;
+  currentValue: boolean;
+  savedAt: string;
+}
 
 type CharacteristicCtor = WithUUID<new () => Characteristic>;
 
@@ -70,6 +79,17 @@ export class CompositeSensor {
   /** Sources we subscribed to change events on (expression refs + optional latch source). */
   private readonly subscribedSources: Source[] = [];
 
+  /**
+   * Absolute path to the JSON file holding this sensor's persisted state, or
+   * undefined if persistence is unavailable (no homebridge api in tests, or
+   * persistPath() not writable). When defined, lastKnown / hasSeenAnyValue /
+   * currentValue survive container restarts — without this, every restart
+   * makes the sensor publish `false` first and then jump to `true` once
+   * sources resolve, firing automations on rising-edge triggers ("welcome
+   * scene fires every time homebridge restarts" bug).
+   */
+  private readonly persistFilePath?: string;
+
   constructor(
     private readonly platform: CompositeSensorPlatform,
     private readonly accessory: PlatformAccessory,
@@ -114,6 +134,12 @@ export class CompositeSensor {
       .getCharacteristic(characteristic)
       .onGet(() => this.currentValue as CharacteristicValue);
 
+    // Resolve the persistence path. Skipped in unit tests where `platform.api`
+    // is not a real homebridge API (the test harness stubs platform with just
+    // log + Service + Characteristic).
+    this.persistFilePath = this.resolvePersistFilePath();
+    this.restorePersistedState();
+
     // Subscribe to source changes. Keep references so we can detach on stop().
     // Includes the latch source even if it's not in the expression — the
     // sensor must re-evaluate when its falling edge happens so a stuck
@@ -130,6 +156,113 @@ export class CompositeSensor {
     }
 
     this.recompute();
+  }
+
+  /**
+   * Build `<homebridge-persist>/composite-sensor-<slug>.json`. Returns
+   * undefined if the homebridge `api.user.persistPath()` accessor isn't
+   * available (e.g. unit tests with a stub platform).
+   */
+  private resolvePersistFilePath(): string | undefined {
+    const api: unknown = (this.platform as unknown as { api?: unknown }).api;
+    const persistPath = (api as { user?: { persistPath?: () => string } } | undefined)
+      ?.user?.persistPath?.();
+    if (typeof persistPath !== "string" || persistPath.length === 0) {
+      return undefined;
+    }
+    const slug = this.config.name
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      || "unnamed";
+    return path.join(persistPath, `composite-sensor-${slug}.json`);
+  }
+
+  /**
+   * Restore lastKnown / hasSeenAnyValue / currentValue from disk if a
+   * previous run left a state file. Crucially also seeds the HAP
+   * characteristic cache via updateCharacteristic so HomeKit's first read
+   * after the accessory is announced returns the persisted value, NOT the
+   * default `false`. Without this seeding, the very first source-resolved
+   * recompute() emits a false→true transition that fires every "welcome
+   * scene" automation each time the homebridge container restarts.
+   */
+  private restorePersistedState(): void {
+    if (!this.persistFilePath) {
+      return;
+    }
+    let raw: string;
+    try {
+      raw = fs.readFileSync(this.persistFilePath, "utf-8");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        this.platform.log.warn(
+          `Sensor "${this.config.name}" failed to read persisted state from ${this.persistFilePath}: ${(err as Error).message}`,
+        );
+      }
+      return;
+    }
+    let data: PersistedSensorState;
+    try {
+      data = JSON.parse(raw);
+    } catch (err) {
+      this.platform.log.warn(
+        `Sensor "${this.config.name}" persisted state at ${this.persistFilePath} is not valid JSON; ignoring: ${(err as Error).message}`,
+      );
+      return;
+    }
+    if (
+      typeof data.lastKnown !== "boolean"
+      || typeof data.hasSeenAnyValue !== "boolean"
+      || typeof data.currentValue !== "boolean"
+    ) {
+      this.platform.log.warn(
+        `Sensor "${this.config.name}" persisted state at ${this.persistFilePath} is missing required fields; ignoring`,
+      );
+      return;
+    }
+    this.lastKnown = data.lastKnown;
+    this.hasSeenAnyValue = data.hasSeenAnyValue;
+    this.currentValue = data.currentValue;
+    // Seed HAP cache so HomeKit's initial read returns the right value.
+    // updateCharacteristic on a service whose accessory hasn't been
+    // announced yet just sets the cached value — no notifications fire.
+    this.service.updateCharacteristic(this.primaryCharacteristic, data.currentValue);
+    this.platform.log.info(
+      `Sensor "${this.config.name}" restored persisted state: lastKnown=${data.lastKnown}, currentValue=${data.currentValue} (saved ${data.savedAt})`,
+    );
+  }
+
+  /**
+   * Atomically write current state to disk. Caller must only invoke this when
+   * something *changed* — we don't dedupe writes here. Best-effort: errors
+   * are logged but never thrown, so a flaky filesystem can't break the
+   * sensor's runtime evaluation.
+   */
+  private persistState(): void {
+    if (!this.persistFilePath) {
+      return;
+    }
+    const tmpPath = `${this.persistFilePath}.tmp`;
+    const payload: PersistedSensorState = {
+      lastKnown: this.lastKnown,
+      hasSeenAnyValue: this.hasSeenAnyValue,
+      currentValue: this.currentValue,
+      savedAt: new Date().toISOString(),
+    };
+    try {
+      fs.writeFileSync(tmpPath, JSON.stringify(payload));
+      fs.renameSync(tmpPath, this.persistFilePath);
+    } catch (err) {
+      this.platform.log.warn(
+        `Sensor "${this.config.name}" failed to persist state to ${this.persistFilePath}: ${(err as Error).message}`,
+      );
+      try {
+        fs.unlinkSync(tmpPath);
+      } catch {
+        // Ignore — tmp may not exist.
+      }
+    }
   }
 
   /**
@@ -186,8 +319,12 @@ export class CompositeSensor {
       result = this.applyDegradedPolicy();
     } else {
       result = evaluated;
+      const lastKnownChanged = this.lastKnown !== evaluated || !this.hasSeenAnyValue;
       this.lastKnown = evaluated;
       this.hasSeenAnyValue = true;
+      if (lastKnownChanged) {
+        this.persistState();
+      }
     }
 
     this.applyWithHold(result);
@@ -294,5 +431,8 @@ export class CompositeSensor {
     this.currentValue = v;
     this.service.updateCharacteristic(this.primaryCharacteristic, v);
     this.platform.log.info(`Sensor "${this.config.name}" -> ${v}`);
+    // Persist on every published edge so a restart between (a) the source
+    // flipping and (b) the sensor's stable post-hold value is captured.
+    this.persistState();
   }
 }
