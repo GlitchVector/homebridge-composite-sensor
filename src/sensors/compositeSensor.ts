@@ -340,34 +340,24 @@ export class CompositeSensor {
   }
 
   /**
-   * Return true if the latch condition permits a true→false flip right now.
-   * Semantics: a flip is only allowed if the latch source has had a falling
-   * edge within the configured window. If no latch source is configured,
-   * always permits. Called twice — at the moment applyWithHold receives a
-   * false and again at the end of the holdSeconds timer — so a latch-expiry
-   * during the hold window correctly stops the flip.
-   */
-  private latchPermitsFlip(): boolean {
-    if (!this.latchSource) {
-      return true;
-    }
-    const edge = this.latchSource.lastFallingEdgeAt;
-    if (edge === undefined) {
-      return false;
-    }
-    return Date.now() - edge <= this.latchWindowMs;
-  }
-
-  /**
-   * Hold semantics: false→true fires instantly; true→false is deferred for
-   * `holdSeconds` and only fires if the expression is still false at the end.
-   * A new `true` during the hold cancels the pending false.
+   * Hold + latch semantics: false→true fires instantly; true→false is
+   * deferred by `max(holdSeconds, latchEdgeWindowSeconds)` ms and only fires
+   * if the expression is still false at the end. A new `true` during the
+   * defer (from ANY source change, including `latchUntilEdgeOf`) cancels
+   * the pending false via the change-driven recompute path; a subsequent
+   * fall back to false re-schedules a fresh defer, so motion edges
+   * naturally extend the hold without any explicit latch-veto logic.
    *
-   * Latch semantics (when `latchUntilEdgeOf` is configured): a true→false
-   * flip is additionally gated on the latch source having had a recent
-   * falling edge. Without that, the sensor stays `true` indefinitely —
-   * suitable for "somebody home" where absence of presence ≠ absence
-   * from home (bedroom stillness, etc.).
+   * Why this is simpler than the previous "latchPermitsFlip" gate: the old
+   * design required `latchUntilEdgeOf` to have had a *recent* falling edge
+   * before allowing any true→false flip. That's correct only if every exit
+   * path passes the latch source — but if the user genuinely leaves quietly
+   * (or the latch source's falling edge was ages ago), the sensor stays
+   * `true` forever. Diagnosed 2026-04-30: Somebody-Home stuck `true` 7+
+   * hours after the user left, because the Hue Livingroom motion sensor
+   * (latchUntilEdgeOf) hadn't fallen within latchEdgeWindowSeconds=900,
+   * so flips were permanently denied. Replaced with the simpler
+   * deferred-flip-with-source-cancels approach above.
    */
   private applyWithHold(next: boolean): void {
     if (next === this.currentValue) {
@@ -388,17 +378,10 @@ export class CompositeSensor {
       return;
     }
 
-    // next === false: latch veto takes priority over hold defer.
-    if (!this.latchPermitsFlip()) {
-      if (this.pendingFalseTimer) {
-        clearTimeout(this.pendingFalseTimer);
-        this.pendingFalseTimer = undefined;
-      }
-      return;
-    }
-
-    // defer if configured.
-    if (this.holdMs === 0) {
+    // next === false: defer flip for max(hold, latch). Either yields the
+    // same baseline behaviour (instant flip, no defer) when both are zero.
+    const deferMs = Math.max(this.holdMs, this.latchSource ? this.latchWindowMs : 0);
+    if (deferMs === 0) {
       this.setValue(false);
       return;
     }
@@ -407,7 +390,7 @@ export class CompositeSensor {
     }
     this.pendingFalseTimer = setTimeout(() => {
       this.pendingFalseTimer = undefined;
-      // Re-check in case sources flipped back to true during the hold.
+      // Re-check in case sources flipped back to true during the defer.
       const values = new Map<string, boolean | undefined>();
       let anyDegraded = false;
       for (const ref of this.referencedSources) {
@@ -421,10 +404,10 @@ export class CompositeSensor {
       const finalValue = (anyDegraded || evaluated === undefined)
         ? this.applyDegradedPolicy()
         : evaluated;
-      if (!finalValue && this.latchPermitsFlip()) {
+      if (!finalValue) {
         this.setValue(false);
       }
-    }, this.holdMs);
+    }, deferMs);
   }
 
   private setValue(v: boolean): void {
