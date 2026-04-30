@@ -11,6 +11,7 @@ import {
 import type { AccessoryObject } from "hap-controller/lib/model/accessory.js";
 import type { CharacteristicObject } from "hap-controller/lib/model/characteristic.js";
 import * as fs from "fs/promises";
+import * as net from "net";
 import * as path from "path";
 import type { HapBridgeConfig, HapService } from "./hapBridge.js";
 
@@ -26,6 +27,14 @@ type Listener = (value: unknown, degraded: boolean) => void;
 interface StoredPairing {
   deviceId: string;
   pairingData: PairingData;
+  /**
+   * Last successfully-validated HAP port for this accessory. HAP TCP ports
+   * are ephemeral (re-assigned on every accessory reboot), so the configured
+   * `port` in the platform yaml goes stale fast. Persisting the most-recent
+   * good port lets us reconnect across our OWN restarts without having to
+   * re-discover via mDNS or TCP-scan every cold boot.
+   */
+  lastKnownPort?: number;
 }
 
 /**
@@ -197,6 +206,106 @@ export class NativeHapBridge extends EventEmitter {
   }
 
   /**
+   * Last-resort fallback when both the configured port and mDNS rediscovery
+   * fail. TCP-probes the accessory's IP across the IANA ephemeral range
+   * (49152–65535) in parallel batches, then validates each open candidate
+   * by attempting an authenticated `getAccessories()` with the stored
+   * pairing — only an accessory that actually speaks HAP and accepts our
+   * long-term keys returns success.
+   *
+   * Why this exists: in some network setups (Docker bridge networks, VLAN
+   * splits, qvs0 + macvlan-shim coexistence on QTS, anything that breaks
+   * mDNS multicast forwarding) the FP2 broadcasts its new HAP port but
+   * nothing reaches the homebridge container's avahi/bonjour listener. Pre-
+   * patch, the plugin would loop "mDNS discovery timeout" forever after any
+   * accessory reboot — sensors silently freeze on `onDegraded: lastKnown`,
+   * which is exactly the bug we hit on 2026-04-30 (fp2-livingroom rotated
+   * 62137 → 62350, neither configured nor cached worked, mDNS saw nothing,
+   * Somebody-Home stuck ON for 7+ hours).
+   *
+   * Cost: scanning 16384 ports with concurrency 256 takes ~5–10s on a quiet
+   * LAN. We pay this once per accessory port rotation; after success the
+   * resolved port is persisted in the pairing file so subsequent restarts
+   * skip straight to the cached port.
+   */
+  private async resolveByPortScan(
+    stored: StoredPairing,
+    {
+      lo = 49152,
+      hi = 65535,
+      concurrency = 256,
+      tcpTimeoutMs = 1500,
+    }: { lo?: number; hi?: number; concurrency?: number; tcpTimeoutMs?: number } = {},
+  ): Promise<number | null> {
+    const probePort = (port: number): Promise<boolean> =>
+      new Promise((resolve) => {
+        const socket = new net.Socket();
+        const finish = (ok: boolean) => {
+          try {
+            socket.destroy();
+          } catch {
+            /* best-effort */
+          }
+          resolve(ok);
+        };
+        socket.setTimeout(tcpTimeoutMs);
+        socket.once("connect", () => finish(true));
+        socket.once("error", () => finish(false));
+        socket.once("timeout", () => finish(false));
+        socket.connect(port, this.config.host);
+      });
+
+    const candidates: number[] = [];
+    for (let start = lo; start <= hi; start += concurrency) {
+      const end = Math.min(start + concurrency, hi + 1);
+      const batch: Promise<{ port: number; open: boolean }>[] = [];
+      for (let p = start; p < end; p++) {
+        batch.push(probePort(p).then((open) => ({ port: p, open })));
+      }
+      const results = await Promise.all(batch);
+      for (const r of results) {
+        if (r.open) candidates.push(r.port);
+      }
+    }
+
+    if (candidates.length === 0) {
+      this.log.warn(
+        `HAP bridge "${this.config.name}" port-scan found NO open ports on ${this.config.host} in [${lo}-${hi}] — accessory likely offline or firewalled`,
+      );
+      return null;
+    }
+    this.log.info(
+      `HAP bridge "${this.config.name}" port-scan found ${candidates.length} open port(s): ${candidates.slice(0, 10).join(", ")}${candidates.length > 10 ? "…" : ""}`,
+    );
+
+    // Phase 2: validate each candidate as a real HAP listener that accepts
+    // our long-term keys. The first match wins.
+    for (const port of candidates) {
+      const client = new HttpClient(
+        stored.deviceId,
+        this.config.host,
+        port,
+        stored.pairingData,
+        { usePersistentConnections: true },
+      );
+      try {
+        await client.getAccessories();
+        await client.close().catch(() => undefined);
+        this.log.info(
+          `HAP bridge "${this.config.name}" port-scan validated HAP on ${this.config.host}:${port}`,
+        );
+        return port;
+      } catch {
+        await client.close().catch(() => undefined);
+      }
+    }
+    this.log.warn(
+      `HAP bridge "${this.config.name}" port-scan: ${candidates.length} open port(s) but none accepted our pairing — possible re-pair needed`,
+    );
+    return null;
+  }
+
+  /**
    * Resolve the accessory's HAP deviceId + current port via mDNS. Needed on
    * first pair (we don't know the deviceId until we see the TXT record) and
    * on reconnect if the advertised port drifted.
@@ -272,7 +381,7 @@ export class NativeHapBridge extends EventEmitter {
       if (!pairingData) {
         throw new Error("pairSetup returned no long-term data");
       }
-      stored = { deviceId: svc.id, pairingData };
+      stored = { deviceId: svc.id, pairingData, lastKnownPort: svc.port };
       await this.savePairing(stored);
       this.currentPort = svc.port;
       this.log.info(
@@ -282,9 +391,14 @@ export class NativeHapBridge extends EventEmitter {
 
     this.deviceId = stored.deviceId;
 
-    // Reconnect path: use configured port first, fall back to mDNS lookup if
-    // the accessory rotated its port since last time.
-    let port = this.currentPort ?? this.config.port;
+    // Reconnect path: try ports in this order:
+    //   1. in-memory `currentPort` (last successful in this process lifetime)
+    //   2. persisted `lastKnownPort` from the pairing file (survives our restarts)
+    //   3. configured `port` from the platform yaml
+    //   4. mDNS rediscovery
+    //   5. TCP port-scan + HAP-pairing-validation (resolveByPortScan)
+    // Steps 4–5 only fire if 1–3 all return ECONNREFUSED.
+    let port = this.currentPort ?? stored.lastKnownPort ?? this.config.port;
     const client = new HttpClient(
       stored.deviceId,
       this.config.host,
@@ -300,9 +414,33 @@ export class NativeHapBridge extends EventEmitter {
         `HAP bridge "${this.config.name}" initial getAccessories failed on port ${port}, re-resolving via mDNS: ${(err as Error).message}`,
       );
       await client.close().catch(() => undefined);
-      const svc = await this.resolveFromMdns();
-      port = svc.port;
+      let resolvedPort: number | undefined;
+      try {
+        const svc = await this.resolveFromMdns();
+        resolvedPort = svc.port;
+      } catch (mdnsErr) {
+        this.log.warn(
+          `HAP bridge "${this.config.name}" mDNS rediscovery failed (${(mdnsErr as Error).message}), falling back to TCP port-scan`,
+        );
+        const scanned = await this.resolveByPortScan(stored);
+        if (scanned !== null) {
+          resolvedPort = scanned;
+        }
+      }
+      if (resolvedPort === undefined) {
+        throw new Error(
+          `HAP bridge "${this.config.name}" — both mDNS and TCP port-scan failed; no HAP listener found on ${this.config.host}`,
+        );
+      }
+      port = resolvedPort;
       this.currentPort = port;
+      // Persist the rediscovered port so future restarts skip the slow
+      // discovery path. Best-effort — a save failure isn't fatal here.
+      await this.savePairing({ ...stored, lastKnownPort: port }).catch((e) =>
+        this.log.warn(
+          `HAP bridge "${this.config.name}" failed to persist lastKnownPort=${port}: ${(e as Error).message}`,
+        ),
+      );
       this.client = new HttpClient(
         stored.deviceId,
         this.config.host,
@@ -317,6 +455,15 @@ export class NativeHapBridge extends EventEmitter {
 
     this.client = client;
     this.currentPort = port;
+    // First-try success: persist the port if the pairing file didn't already
+    // record it. Avoids re-write on every connect once stable.
+    if (stored.lastKnownPort !== port) {
+      await this.savePairing({ ...stored, lastKnownPort: port }).catch((e) =>
+        this.log.warn(
+          `HAP bridge "${this.config.name}" failed to persist lastKnownPort=${port}: ${(e as Error).message}`,
+        ),
+      );
+    }
     const data = await client.getAccessories();
     this.finishConnectAndSubscribe(data.accessories);
   }
