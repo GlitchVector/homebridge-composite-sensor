@@ -356,7 +356,9 @@ export class CompositeSensor {
       ? `, pendingDoorCheckAt=${new Date(this.pendingDoorCheckAt).toISOString()}`
       : "";
     this.platform.log.info(
-      `Sensor "${this.config.name}" restored persisted state: lastKnown=${data.lastKnown}, currentValue=${data.currentValue}${pendingMsg} (saved ${data.savedAt})`,
+      `Sensor "${this.config.name}" restored persisted state: ` +
+        `lastKnown=${data.lastKnown}, currentValue=${data.currentValue}` +
+        `${pendingMsg} (saved ${data.savedAt})`,
     );
   }
 

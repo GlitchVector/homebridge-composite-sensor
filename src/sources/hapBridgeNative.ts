@@ -264,7 +264,9 @@ export class NativeHapBridge extends EventEmitter {
       }
       const results = await Promise.all(batch);
       for (const r of results) {
-        if (r.open) candidates.push(r.port);
+        if (r.open) {
+          candidates.push(r.port);
+        }
       }
     }
 
@@ -274,8 +276,11 @@ export class NativeHapBridge extends EventEmitter {
       );
       return null;
     }
+    const sample = candidates.slice(0, 10).join(", ");
+    const ellipsis = candidates.length > 10 ? "…" : "";
     this.log.info(
-      `HAP bridge "${this.config.name}" port-scan found ${candidates.length} open port(s): ${candidates.slice(0, 10).join(", ")}${candidates.length > 10 ? "…" : ""}`,
+      `HAP bridge "${this.config.name}" port-scan found ${candidates.length} ` +
+        `open port(s): ${sample}${ellipsis}`,
     );
 
     // Phase 2: validate each candidate as a real HAP listener that accepts
