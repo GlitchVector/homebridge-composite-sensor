@@ -213,3 +213,61 @@ export function evaluate(
     }
   }
 }
+
+// Like evaluate(), but degraded operands "abstain" — a working branch can
+// still decide the result without an undefined sibling poisoning it. Only
+// returns undefined when NO branch is working (genuine total information loss).
+//
+// The presence-detector OR aggregate ("any room saw someone → home") is the
+// motivating case: with strict Kleene logic, `false OR undefined = undefined`
+// keeps the sensor stuck on lastKnown forever the moment one HAP TCP drops,
+// even though every other room reports a clean silent. Door-anchor mode opts
+// into this so the door event actually decides at check-time. AND is treated
+// symmetrically: a degraded operand abstains, the determinate side wins.
+export function evaluateAbstain(
+  ast: Ast,
+  values: Map<string, boolean | undefined>,
+): boolean | undefined {
+  switch (ast.kind) {
+    case "id":
+      return values.get(ast.name);
+    case "not": {
+      const v = evaluateAbstain(ast.expr, values);
+      return v === undefined ? undefined : !v;
+    }
+    case "and": {
+      const l = evaluateAbstain(ast.left, values);
+      if (l === false) {
+        return false;
+      }
+      const r = evaluateAbstain(ast.right, values);
+      if (r === false) {
+        return false;
+      }
+      if (l === true && r === true) {
+        return true;
+      }
+      if (l === true || r === true) {
+        return true;  // sibling abstains, working side decides
+      }
+      return undefined;  // both abstain
+    }
+    case "or": {
+      const l = evaluateAbstain(ast.left, values);
+      if (l === true) {
+        return true;
+      }
+      const r = evaluateAbstain(ast.right, values);
+      if (r === true) {
+        return true;
+      }
+      if (l === false && r === false) {
+        return false;
+      }
+      if (l === false || r === false) {
+        return false;  // sibling abstains, working side decides
+      }
+      return undefined;  // both abstain
+    }
+  }
+}
