@@ -1,4 +1,5 @@
 import { PlatformAccessory, Service, CharacteristicValue, WithUUID, Characteristic } from "homebridge";
+import { EventEmitter } from "node:events";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Ast, evaluate, evaluateAbstain, parseExpression, collectIdentifiers } from "../dsl/parser.js";
@@ -30,7 +31,8 @@ export type OnDegradedPolicy = "false" | "true" | "lastKnown";
 export interface CompositeSensorConfig {
   name: string;
   service: SensorServiceKind;
-  expression: string;
+  /** Required for `mode: "reactive"` and `mode: "door-anchor"`; unused for `mode: "set-reset"`. */
+  expression?: string;
   /** Seconds to wait on true→false before emitting false. Default 0 (no hold). */
   holdSeconds?: number;
   /** What to emit when any referenced source is degraded. Default "false". */
@@ -74,8 +76,22 @@ export interface CompositeSensorConfig {
    * in any radar zone?" five minutes after a door crossing happened.
    *
    * `latchUntilEdgeOf`, `holdSeconds` are ignored in door-anchor mode.
+   *
+   * `"set-reset"` is a pure SR flip-flop driven by two trigger expressions.
+   * The rising edge of `setOn` flips state to true (suppressed when `resetOn`
+   * is currently true, so a `setOn` rising while a "reset condition" is
+   * already active is treated as a non-event — prevents false positives
+   * when the set expression is broader than the reset). The rising edge of
+   * `resetOn` flips state to false unconditionally. Useful for inferring
+   * occupancy of a room with no dedicated presence sensor (e.g. bathroom):
+   * `setOn` is the room's motion sensor (or any motion), `resetOn` is the
+   * OR over all presence-detected zones — entering a presence-detected zone
+   * resets, while a covered room with motion + no other zone active sets.
+   * Between rising edges, state is sticky. `expression`, `holdSeconds`,
+   * `latchUntilEdgeOf`, `doorSource`, `checkAfterMinutes`, `onDegraded` are
+   * ignored in set-reset mode.
    */
-  mode?: "reactive" | "door-anchor";
+  mode?: "reactive" | "door-anchor" | "set-reset";
   /** Required when mode === "door-anchor". Source name for the door contact. */
   doorSource?: string;
   /** Default 5. Only meaningful when mode === "door-anchor". */
@@ -90,6 +106,10 @@ export interface CompositeSensorConfig {
    * and we re-detect them without needing another door crossing.
    */
   autoCorrectOnPresence?: boolean;
+  /** Required when mode === "set-reset". Boolean expression whose rising edge sets state=true. */
+  setOn?: string;
+  /** Required when mode === "set-reset". Boolean expression whose rising edge sets state=false. */
+  resetOn?: string;
 }
 
 /**
@@ -100,8 +120,8 @@ export interface CompositeSensorConfig {
  * applies onDegraded + holdSeconds, and pushes the final value through
  * `updateCharacteristic` on the Home app.
  */
-export class CompositeSensor {
-  private readonly ast: Ast;
+export class CompositeSensor extends EventEmitter {
+  private readonly ast?: Ast;
   private readonly referencedSources: string[];
   private readonly service: Service;
   private readonly primaryCharacteristic: CharacteristicCtor;
@@ -109,10 +129,26 @@ export class CompositeSensor {
   private readonly onDegraded: OnDegradedPolicy;
   private readonly latchSource?: Source;
   private readonly latchWindowMs: number;
-  private readonly mode: "reactive" | "door-anchor";
+  private readonly mode: "reactive" | "door-anchor" | "set-reset";
   private readonly doorSource?: Source;
   private readonly checkAfterMs: number;
   private readonly autoCorrectOnPresence: boolean;
+  /** Set-reset mode: rising edge sets state=true. */
+  private readonly setOnAst?: Ast;
+  /** Set-reset mode: rising edge sets state=false. */
+  private readonly resetOnAst?: Ast;
+  /**
+   * Set-reset mode: per-source trigger leaves extracted from `resetOnAst`.
+   * Each entry says "watch source X for a transition in direction P". Bare
+   * identifier X yields {X, rising}; NOT X yields {X, falling}; OR splits
+   * into the union; AND/complex-NOT yield no leaves (caller falls back to
+   * whole-expression edges, which is the conservative behavior).
+   */
+  private readonly resetTriggerLeaves: { sourceName: string; polarity: "rising" | "falling" }[] = [];
+  /** Set-reset mode: last evaluated value of setOn (false/true/undefined for degraded). */
+  private setOnLast?: boolean;
+  /** Set-reset mode: last per-source values of resetOn refs (for per-source edge detection). */
+  private readonly resetSourceLast = new Map<string, boolean | undefined>();
   private pendingDoorCheckTimer?: NodeJS.Timeout;
   /** Epoch ms when the pending door-anchor check should fire. Persisted. */
   private pendingDoorCheckAt?: number;
@@ -146,8 +182,7 @@ export class CompositeSensor {
     private readonly config: CompositeSensorConfig,
     private readonly sources: Map<string, Source>,
   ) {
-    this.ast = parseExpression(config.expression);
-    this.referencedSources = collectIdentifiers(this.ast);
+    super();
     this.holdMs = Math.max(0, (config.holdSeconds ?? 0) * 1000);
     this.onDegraded = config.onDegraded ?? "false";
     this.latchWindowMs = Math.max(0, (config.latchEdgeWindowSeconds ?? 300) * 1000);
@@ -155,18 +190,46 @@ export class CompositeSensor {
     this.checkAfterMs = Math.max(0, (config.checkAfterMinutes ?? 5) * 60_000);
     this.autoCorrectOnPresence = config.autoCorrectOnPresence ?? true;
 
-    for (const ref of this.referencedSources) {
-      if (!sources.has(ref)) {
+    if (this.mode === "set-reset") {
+      if (!config.setOn || !config.resetOn) {
         throw new Error(
-          `Sensor "${config.name}" references unknown source "${ref}" in expression "${config.expression}"`,
+          `Sensor "${config.name}" mode "set-reset" requires both setOn and resetOn`,
         );
+      }
+      this.setOnAst = parseExpression(config.setOn);
+      this.resetOnAst = parseExpression(config.resetOn);
+      const setRefs = collectIdentifiers(this.setOnAst);
+      const resetRefs = collectIdentifiers(this.resetOnAst);
+      this.referencedSources = Array.from(new Set([...setRefs, ...resetRefs]));
+      this.resetTriggerLeaves = collectResetTriggerLeaves(this.resetOnAst);
+      for (const ref of this.referencedSources) {
+        if (!sources.has(ref)) {
+          throw new Error(
+            `Sensor "${config.name}" mode "set-reset" references unknown source "${ref}"`,
+          );
+        }
+      }
+    } else {
+      if (!config.expression) {
+        throw new Error(
+          `Sensor "${config.name}" mode "${this.mode}" requires expression`,
+        );
+      }
+      this.ast = parseExpression(config.expression);
+      this.referencedSources = collectIdentifiers(this.ast);
+      for (const ref of this.referencedSources) {
+        if (!sources.has(ref)) {
+          throw new Error(
+            `Sensor "${config.name}" references unknown source "${ref}" in expression "${config.expression}"`,
+          );
+        }
       }
     }
 
     if (config.latchUntilEdgeOf) {
-      if (this.mode === "door-anchor") {
+      if (this.mode === "door-anchor" || this.mode === "set-reset") {
         throw new Error(
-          `Sensor "${config.name}": latchUntilEdgeOf is incompatible with mode "door-anchor" — door-anchor IS the anchoring strategy, no latch overlay needed`,
+          `Sensor "${config.name}": latchUntilEdgeOf is incompatible with mode "${this.mode}" — that mode owns its own state machine, no latch overlay needed`,
         );
       }
       const src = sources.get(config.latchUntilEdgeOf);
@@ -209,7 +272,22 @@ export class CompositeSensor {
     // is not a real homebridge API (the test harness stubs platform with just
     // log + Service + Characteristic).
     this.persistFilePath = this.resolvePersistFilePath();
-    this.restorePersistedState();
+    if (this.mode === "set-reset") {
+      // Set-reset mode: always cold-start at false. The persisted state is
+      // stale by definition after a restart — we don't know whether the
+      // user is still in the modeled location. The next setOn rising edge
+      // (real motion) will flip true; the next resetOn rising edge will
+      // confirm-and-flip-false. Skipping restore avoids spuriously
+      // reporting `Bathroom Occupied: true` for an empty bathroom after
+      // every homebridge restart.
+      this.lastKnown = false;
+      this.hasSeenAnyValue = false;
+      this.currentValue = false;
+      this.service.updateCharacteristic(this.primaryCharacteristic, false);
+      this.persistState();
+    } else {
+      this.restorePersistedState();
+    }
 
     // Door-anchor cold-start default: home (true). Per the design doc:
     // "State defaults to `home`. Sticky between events. Persisted to disk."
@@ -447,8 +525,70 @@ export class CompositeSensor {
       this.recomputeDoorAnchor();
       return;
     }
+    if (this.mode === "set-reset") {
+      this.recomputeSetReset();
+      return;
+    }
     const result = this.evaluateOnce();
     this.applyWithHold(result);
+  }
+
+  /**
+   * Set-reset mode: pure SR flip-flop. Re-evaluate setOn and resetOn
+   * against current source values, fire on rising edges only.
+   *
+   *  - Reset trigger: any individual source referenced by `resetOn` had
+   *    a false→true transition AND `resetOn` currently evaluates true.
+   *    Per-source edge detection (rather than whole-expression edge) is
+   *    necessary for OR-aggregated resetOn ("any FP2 zone detects
+   *    presence"): if one zone is already lingering-true at the moment
+   *    a different zone rises, the OR result stays true→true and a
+   *    whole-expression edge would never fire — yet the user has clearly
+   *    moved into a covered zone. Per-source edge detection catches
+   *    that. The `resetNow === true` gate keeps the semantics correct
+   *    for AND/NOT compositions (a source rising that doesn't actually
+   *    make resetOn true is not a reset trigger).
+   *  - Reset wins over a coincident set (checked first and returns).
+   *  - Set trigger: `setOn` whole-expression false→true. Unconditional —
+   *    no "suppress while resetOn is true" guard, because real-world FP2
+   *    zones have ~2 s+ settle lag on falling edges, so the previous
+   *    zone is still showing presence at the moment a Hue motion sensor
+   *    in a non-covered room fires. Avoid false positives by *narrowing*
+   *    setOn (e.g. only the room's own motion sensor).
+   *
+   * `undefined → true` (initial dispatch from a freshly-resolved source)
+   * is treated as baseline initialization, not a rising edge — otherwise
+   * plugin startup would spuriously fire if the trigger expression
+   * happens to be true at boot.
+   */
+  private recomputeSetReset(): void {
+    const values = new Map<string, boolean | undefined>();
+    for (const name of this.referencedSources) {
+      const src = this.sources.get(name)!;
+      values.set(name, src.degraded ? undefined : src.value);
+    }
+    const setNow = evaluate(this.setOnAst!, values);
+    const resetNow = evaluate(this.resetOnAst!, values);
+    const setRose = this.setOnLast === false && setNow === true;
+    let resetTriggered = false;
+    for (const leaf of this.resetTriggerLeaves) {
+      const prev = this.resetSourceLast.get(leaf.sourceName);
+      const now = values.get(leaf.sourceName);
+      if (leaf.polarity === "rising" && prev === false && now === true) {
+        resetTriggered = true;
+      } else if (leaf.polarity === "falling" && prev === true && now === false) {
+        resetTriggered = true;
+      }
+      this.resetSourceLast.set(leaf.sourceName, now);
+    }
+    this.setOnLast = setNow;
+    if (resetTriggered && resetNow === true) {
+      this.setValue(false);
+      return;
+    }
+    if (setRose) {
+      this.setValue(true);
+    }
   }
 
   /**
@@ -485,8 +625,8 @@ export class CompositeSensor {
       values.set(ref, src.degraded ? undefined : src.value);
     }
     return this.mode === "door-anchor"
-      ? evaluateAbstain(this.ast, values)
-      : evaluate(this.ast, values);
+      ? evaluateAbstain(this.ast!, values)
+      : evaluate(this.ast!, values);
   }
 
   /**
@@ -626,5 +766,56 @@ export class CompositeSensor {
     // Persist on every published edge so a restart between (a) the source
     // flipping and (b) the sensor's stable post-hold value is captured.
     this.persistState();
+    // Notify any sensor that referenced this one as a source. Source
+    // adapters listen and forward via Source.update(), which is itself
+    // edge-detected so a same-value emit here is harmless.
+    this.emit("change", v);
+  }
+
+  /** Current published value. Used by SensorAsSource adapter. */
+  public getCurrentValue(): boolean {
+    return this.currentValue;
+  }
+
+  /** Sensor display name. Used by SensorAsSource adapter to expose under a slug. */
+  public getName(): string {
+    return this.config.name;
+  }
+}
+
+/**
+ * Walk a `resetOn` AST and extract per-source trigger leaves with polarity.
+ *
+ *  - `id X` →     [{X, rising}]   (source going false→true triggers)
+ *  - `NOT X` →    [{X, falling}]  (source going true→false triggers — e.g.
+ *                                   a light switch turning off)
+ *  - `OR(L,R)` → leaves(L) ++ leaves(R)
+ *  - `AND` and `NOT (complex)` → no leaves; caller will fall back to
+ *    whole-expression rising-edge detection (preserving existing semantics
+ *    for `A AND B` reset triggers).
+ *
+ * Used only for `mode: "set-reset"` resetOn evaluation, where per-source
+ * edges matter even when the OR-aggregate stays true→true (e.g. one FP2
+ * zone is lingering when another rises). The trigger gate is still the
+ * whole-expression value being currently true.
+ */
+function collectResetTriggerLeaves(
+  ast: Ast,
+): { sourceName: string; polarity: "rising" | "falling" }[] {
+  switch (ast.kind) {
+    case "id":
+      return [{ sourceName: ast.name, polarity: "rising" }];
+    case "not":
+      if (ast.expr.kind === "id") {
+        return [{ sourceName: ast.expr.name, polarity: "falling" }];
+      }
+      return [];
+    case "or":
+      return [
+        ...collectResetTriggerLeaves(ast.left),
+        ...collectResetTriggerLeaves(ast.right),
+      ];
+    case "and":
+      return [];
   }
 }

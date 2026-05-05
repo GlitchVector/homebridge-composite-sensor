@@ -15,6 +15,7 @@ import { MqttBroker, MqttConfig } from "./sources/mqttBroker.js";
 import { MqttSource, MqttSourceConfig } from "./sources/mqttSource.js";
 import { HapBridge, HapBridgeConfig } from "./sources/hapBridge.js";
 import { HapSource, HapSourceConfig } from "./sources/hapSource.js";
+import { SensorAsSource, sensorSourceSlug } from "./sources/sensorAsSource.js";
 import { CompositeSensor, CompositeSensorConfig } from "./sensors/compositeSensor.js";
 import { LightSensor, LightSensorConfig } from "./sensors/lightSensor.js";
 
@@ -144,11 +145,21 @@ export class CompositeSensorPlatform implements DynamicPlatformPlugin {
           );
           continue;
         }
-      } else if (!(sensorConfig as CompositeSensorConfig).expression) {
-        this.log.error(
-          `composite sensor "${sensorConfig.name}" missing required field: expression`,
-        );
-        continue;
+      } else {
+        const cfg = sensorConfig as CompositeSensorConfig;
+        if (cfg.mode === "set-reset") {
+          if (!cfg.setOn || !cfg.resetOn) {
+            this.log.error(
+              `composite sensor "${sensorConfig.name}" mode "set-reset" requires setOn and resetOn`,
+            );
+            continue;
+          }
+        } else if (!cfg.expression) {
+          this.log.error(
+            `composite sensor "${sensorConfig.name}" missing required field: expression`,
+          );
+          continue;
+        }
       }
       const uuid = this.api.hap.uuid.generate(`composite-sensor:${sensorConfig.name}`);
       desiredUuids.add(uuid);
@@ -168,9 +179,27 @@ export class CompositeSensorPlatform implements DynamicPlatformPlugin {
         if (sensorConfig.service === "light") {
           this.sensors.push(new LightSensor(this, accessory, sensorConfig, this.hapBridges));
         } else {
-          this.sensors.push(
-            new CompositeSensor(this, accessory, sensorConfig as CompositeSensorConfig, this.sources),
+          const composite = new CompositeSensor(
+            this, accessory, sensorConfig as CompositeSensorConfig, this.sources,
           );
+          this.sensors.push(composite);
+          // Expose composite sensors as sources so subsequent sensors can
+          // reference them by a slugified identifier (e.g. "Bathroom Occupied"
+          // → `bathroomOccupied`). Skip if the slug collides with an existing
+          // source name (raw sources win — re-defining over them would be
+          // surprising).
+          const slug = sensorSourceSlug(sensorConfig.name);
+          if (!slug) {
+            this.log.warn(
+              `sensor "${sensorConfig.name}" cannot be exposed as a source — empty slug`,
+            );
+          } else if (this.sources.has(slug)) {
+            this.log.warn(
+              `sensor "${sensorConfig.name}" not exposed as source "${slug}" — name collides with an existing source`,
+            );
+          } else {
+            this.sources.set(slug, new SensorAsSource(slug, composite, this.log));
+          }
         }
       } catch (err) {
         this.log.error(`Failed to build sensor "${sensorConfig.name}":`, (err as Error).message);
