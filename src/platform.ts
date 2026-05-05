@@ -18,9 +18,15 @@ import { HapSource, HapSourceConfig } from "./sources/hapSource.js";
 import { SensorAsSource, sensorSourceSlug } from "./sources/sensorAsSource.js";
 import { CompositeSensor, CompositeSensorConfig } from "./sensors/compositeSensor.js";
 import { LightSensor, LightSensorConfig } from "./sensors/lightSensor.js";
+import { CountSensor, CountSensorConfig } from "./sensors/countSensor.js";
+import { DurationSensor, DurationSensorConfig } from "./sensors/durationSensor.js";
 
 type SourceConfig = MqttSourceConfig | HapSourceConfig;
-type SensorConfig = CompositeSensorConfig | LightSensorConfig;
+type SensorConfig =
+  | CompositeSensorConfig
+  | LightSensorConfig
+  | CountSensorConfig
+  | DurationSensorConfig;
 
 interface CompositeSensorPlatformConfig extends PlatformConfig {
   mqtt?: MqttConfig;
@@ -139,12 +145,21 @@ export class CompositeSensorPlatform implements DynamicPlatformPlugin {
         continue;
       }
       if (sensorConfig.service === "light") {
+        const lightCfg = sensorConfig as LightSensorConfig;
         const hasSingle =
-          sensorConfig.bridge && sensorConfig.accessory && sensorConfig.characteristic;
-        const hasMulti = sensorConfig.sources && sensorConfig.sources.length > 0;
+          lightCfg.bridge && lightCfg.accessory && lightCfg.characteristic;
+        const hasMulti = lightCfg.sources && lightCfg.sources.length > 0;
         if (!hasSingle && !hasMulti) {
           this.log.error(
             `light sensor "${sensorConfig.name}" needs either bridge/accessory/characteristic or a non-empty \`sources\` array`,
+          );
+          continue;
+        }
+      } else if (sensorConfig.service === "count" || sensorConfig.service === "duration") {
+        const cfg = sensorConfig as CountSensorConfig | DurationSensorConfig;
+        if (!Array.isArray(cfg.sources) || cfg.sources.length === 0) {
+          this.log.error(
+            `${sensorConfig.service} sensor "${sensorConfig.name}" needs a non-empty \`sources\` array of source names`,
           );
           continue;
         }
@@ -180,7 +195,17 @@ export class CompositeSensorPlatform implements DynamicPlatformPlugin {
 
       try {
         if (sensorConfig.service === "light") {
-          this.sensors.push(new LightSensor(this, accessory, sensorConfig, this.hapBridges));
+          this.sensors.push(new LightSensor(
+            this, accessory, sensorConfig as LightSensorConfig, this.hapBridges,
+          ));
+        } else if (sensorConfig.service === "count") {
+          this.sensors.push(new CountSensor(
+            this, accessory, sensorConfig as CountSensorConfig, this.sources,
+          ));
+        } else if (sensorConfig.service === "duration") {
+          this.sensors.push(new DurationSensor(
+            this, accessory, sensorConfig as DurationSensorConfig, this.sources,
+          ));
         } else {
           const composite = new CompositeSensor(
             this, accessory, sensorConfig as CompositeSensorConfig, this.sources,
