@@ -139,9 +139,12 @@ export class CompositeSensorPlatform implements DynamicPlatformPlugin {
         continue;
       }
       if (sensorConfig.service === "light") {
-        if (!sensorConfig.bridge || !sensorConfig.accessory || !sensorConfig.characteristic) {
+        const hasSingle =
+          sensorConfig.bridge && sensorConfig.accessory && sensorConfig.characteristic;
+        const hasMulti = sensorConfig.sources && sensorConfig.sources.length > 0;
+        if (!hasSingle && !hasMulti) {
           this.log.error(
-            `light sensor "${sensorConfig.name}" missing required fields (bridge/accessory/characteristic)`,
+            `light sensor "${sensorConfig.name}" needs either bridge/accessory/characteristic or a non-empty \`sources\` array`,
           );
           continue;
         }
