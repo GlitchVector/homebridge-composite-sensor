@@ -62,6 +62,19 @@ export class HomebridgeHapBridge extends EventEmitter {
 
   private readonly resolved = new Map<string, Listener[]>();
 
+  /**
+   * Watchdog state. `@oznu/hap-client` SSE event streams can die silently
+   * (no disconnect event surfaces) — observed in the wild as a `mode:
+   * "homebridge"` bridge going totally quiet for 22h while polling-based
+   * HTTP reads still worked. The watchdog runs `refreshAccessories()` on a
+   * timer to dispatch current values (catches persistent drift) and forces
+   * a monitor rebuild every Nth poll (catches dead SSE streams).
+   */
+  private watchdogTimer?: NodeJS.Timeout;
+  private pollCount = 0;
+  private static readonly WATCHDOG_INTERVAL_MS = 60_000;
+  private static readonly RESET_EVERY_N_POLLS = 5;
+
   constructor(
     public readonly config: HapBridgeConfig,
     private readonly log: Logger,
@@ -100,6 +113,7 @@ export class HomebridgeHapBridge extends EventEmitter {
 
   stop(): void {
     this.stopped = true;
+    this.stopWatchdog();
     try {
       this.monitor?.finish();
     } catch (err) {
@@ -123,6 +137,7 @@ export class HomebridgeHapBridge extends EventEmitter {
       try {
         this.reseedInstance();
         await this.refreshAccessories();
+        this.startWatchdog();
         return;
       } catch (err) {
         this.log.warn(
@@ -134,6 +149,67 @@ export class HomebridgeHapBridge extends EventEmitter {
         attempt++;
         await new Promise((r) => setTimeout(r, delay));
       }
+    }
+  }
+
+  private startWatchdog(): void {
+    if (this.watchdogTimer || this.stopped) {
+      return;
+    }
+    this.watchdogTimer = setInterval(() => {
+      void this.runWatchdog();
+    }, HomebridgeHapBridge.WATCHDOG_INTERVAL_MS);
+    this.watchdogTimer.unref?.();
+  }
+
+  private stopWatchdog(): void {
+    if (this.watchdogTimer) {
+      clearInterval(this.watchdogTimer);
+      this.watchdogTimer = undefined;
+    }
+  }
+
+  /**
+   * Watchdog cycle. Every WATCHDOG_INTERVAL_MS:
+   *  - Refresh accessories via HTTP (independent of SSE health). The
+   *    `onServices()` dispatch will surface any drift to listeners, since
+   *    `Source.update()` only emits "change" on actual transitions.
+   *  - Every Nth cycle, also tear down the SSE monitor first so
+   *    `refreshAccessories()` recreates it. Defense against silent
+   *    `@oznu/hap-client` event-stream death.
+   *
+   * Transient toggles (e.g. door open→close within one interval) can still
+   * be missed if SSE is dead and both edges fall between polls — this
+   * watchdog bounds the silence window, not the per-event guarantee.
+   */
+  private async runWatchdog(): Promise<void> {
+    if (this.stopped || !this.client) {
+      return;
+    }
+    this.pollCount++;
+    const forceMonitorReset =
+      this.pollCount % HomebridgeHapBridge.RESET_EVERY_N_POLLS === 0;
+    if (forceMonitorReset) {
+      this.log.debug(
+        `HAP bridge "${this.config.name}" watchdog: scheduled monitor reset (poll #${this.pollCount})`,
+      );
+      try {
+        this.monitor?.finish();
+      } catch (err) {
+        this.log.debug(
+          `HAP bridge "${this.config.name}" monitor.finish() during watchdog reset threw:`,
+          (err as Error).message,
+        );
+      }
+      this.monitor = undefined;
+    }
+    try {
+      await this.refreshAccessories();
+    } catch (err) {
+      this.log.warn(
+        `HAP bridge "${this.config.name}" watchdog refresh failed:`,
+        (err as Error).message,
+      );
     }
   }
 
