@@ -99,7 +99,10 @@ async function run() {
     sensor["currentValue"] = false; // simulate prior away state, force the path under test
     fp2.push(true);
     door.push(true);
-    expect("D1b-a: state still false before check fires", sensor["currentValue"], false);
+    // Rule 5 (added 2026-05-12): door-while-away flips state to home synchronously.
+    // Was previously asserting `false` here, but the immediate flip is now the
+    // designed behavior. D12 covers rule 5 explicitly; D1b-b still covers rule 2+3.
+    expect("D1b-a: door event while away flips state to home immediately (rule 5)", sensor["currentValue"], true);
     await sleep(80);
     expect("D1b-b: check fires with FP2 active → home", sensor["currentValue"], true);
     sensor.stop();
@@ -334,6 +337,83 @@ async function run() {
     door.push(true);
     await sleep(80);
     expect("D11: degraded branch does NOT mask working true → home", sensor["currentValue"], true);
+    sensor.stop();
+  }
+
+  // --- D12: rule 5, door event while away → instant flip to home ---
+  // Synchronous flip BEFORE the +N check fires. The +N check still runs;
+  // if FP2 is silent at that point, the result self-corrects back to away
+  // (verified by sub-case D12c below).
+  {
+    const fp2 = new FakeSource("fp2", fakeLog);
+    const door = new FakeSource("door", fakeLog);
+    const sources = new Map([["fp2", fp2], ["door", door]]);
+    const sensor = new CompositeSensor(platform, fakeAccessory, {
+      name: "Test D12",
+      service: "occupancy",
+      mode: "door-anchor",
+      doorSource: "door",
+      expression: "fp2",
+      checkAfterMinutes: 0.05 / 60,
+      autoCorrectOnPresence: false,  // isolate rule 5 from rule 4
+    }, sources);
+    sensor["currentValue"] = false;  // simulate prior away state
+    fp2.push(true);                  // user just entered the hallway
+    door.push(true);
+    expect("D12a: door-while-away flips state to home SYNCHRONOUSLY", sensor["currentValue"], true);
+    await sleep(80);
+    expect("D12b: +N check confirms (FP2 active) → still home", sensor["currentValue"], true);
+    sensor.stop();
+  }
+
+  // --- D12c: rule 5 self-correction — door fires while away, FP2 stays silent ---
+  // Brief-open scenario (e.g. delivery): instant flip to home is the false
+  // positive, then the +N check sees FP2 silent and flips back to away.
+  {
+    const fp2 = new FakeSource("fp2", fakeLog);
+    const door = new FakeSource("door", fakeLog);
+    const sources = new Map([["fp2", fp2], ["door", door]]);
+    const sensor = new CompositeSensor(platform, fakeAccessory, {
+      name: "Test D12c",
+      service: "occupancy",
+      mode: "door-anchor",
+      doorSource: "door",
+      expression: "fp2",
+      checkAfterMinutes: 0.05 / 60,
+      autoCorrectOnPresence: false,
+    }, sources);
+    sensor["currentValue"] = false;
+    fp2.push(false);                 // no one actually entered
+    door.push(true);
+    expect("D12c-a: instant flip to home (rule 5)", sensor["currentValue"], true);
+    await sleep(80);
+    expect("D12c-b: +N check sees FP2 silent → self-correct back to away", sensor["currentValue"], false);
+    sensor.stop();
+  }
+
+  // --- D12d: rule 5 is a no-op when state is already home ---
+  // Door event while home must NOT call setValue(true) redundantly — and
+  // critically, must not interfere with rule 2 (the +N check still fires
+  // and can flip to away if FP2 silent).
+  {
+    const fp2 = new FakeSource("fp2", fakeLog);
+    const door = new FakeSource("door", fakeLog);
+    const sources = new Map([["fp2", fp2], ["door", door]]);
+    const sensor = new CompositeSensor(platform, fakeAccessory, {
+      name: "Test D12d",
+      service: "occupancy",
+      mode: "door-anchor",
+      doorSource: "door",
+      expression: "fp2",
+      checkAfterMinutes: 0.05 / 60,
+      autoCorrectOnPresence: false,
+    }, sources);
+    sensor["currentValue"] = true;
+    fp2.push(false);                 // user is leaving
+    door.push(true);
+    expect("D12d-a: door-while-home stays home synchronously", sensor["currentValue"], true);
+    await sleep(80);
+    expect("D12d-b: +N check sees FP2 silent → flip to away (rule 2 unchanged)", sensor["currentValue"], false);
     sensor.stop();
   }
 

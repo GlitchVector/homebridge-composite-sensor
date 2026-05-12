@@ -75,6 +75,11 @@ export interface CompositeSensorConfig {
    * reading is NOT proof of absence; we only ask the question "anyone
    * in any radar zone?" five minutes after a door crossing happened.
    *
+   * Door-while-away ALSO flips state to `home` synchronously (rule 5):
+   * the +N check still runs and self-corrects in the rare delivery /
+   * brief-open case, but the common "user just walked in" path no longer
+   * waits N minutes for the welcome-state transition.
+   *
    * `latchUntilEdgeOf`, `holdSeconds` are ignored in door-anchor mode.
    *
    * `"set-reset"` is a pure SR flip-flop driven by two trigger expressions.
@@ -648,12 +653,29 @@ export class CompositeSensor extends EventEmitter {
 
   /**
    * Door-anchor mode: door source emitted a change (open or close edge).
-   * Cancel any pending check, schedule a fresh one at +checkAfterMs.
+   *
+   * If state is currently `away`, flip to `home` synchronously *before*
+   * scheduling the +N check (rule 5, added 2026-05-12). A door event while
+   * away is overwhelmingly an arrival, and the user is typically in the
+   * entrance/hallway not yet inside an FP2-covered zone — waiting the full
+   * +N min for the welcome-state transition is sluggish. The +N check
+   * still runs and self-corrects the rare false-positive (delivery
+   * briefly opens the door, no one enters → +N min later FP2 silent →
+   * flip back to away). When state is already `home`, the door event is
+   * treated as before: schedule the +N check, no immediate flip.
+   *
+   * Then cancel any pending check, schedule a fresh one at +checkAfterMs.
    * Persist the deadline so a homebridge restart in the gap re-honors it.
    */
   private onDoorChange(): void {
     if (this.mode !== "door-anchor") {
       return;
+    }
+    if (!this.currentValue) {
+      this.platform.log.info(
+        `Sensor "${this.config.name}" door event while away — instant flip to home (rule 5)`,
+      );
+      this.setValue(true);
     }
     if (this.pendingDoorCheckTimer) {
       clearTimeout(this.pendingDoorCheckTimer);
