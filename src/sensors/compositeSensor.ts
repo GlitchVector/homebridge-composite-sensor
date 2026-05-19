@@ -111,6 +111,26 @@ export interface CompositeSensorConfig {
    * and we re-detect them without needing another door crossing.
    */
   autoCorrectOnPresence?: boolean;
+  /**
+   * Default 0 (legacy single-snapshot behavior). Only meaningful when
+   * mode === "door-anchor".
+   *
+   * When > 0, the +checkAfterMinutes scheduled check applies a sustained-true
+   * requirement: if the expression initially evaluates to true, the publish
+   * is deferred and the expression is re-sampled every 30s until either
+   * (a) a sample evaluates to false (publish false immediately and exit),
+   * or (b) `stableForSeconds` elapse with every sample staying true (publish
+   * true). This catches the failure mode where a transient FP2 / mmWave
+   * false-positive happens to coincide with the +N check moment and latches
+   * the sensor to true even though presence cleared seconds later. Set
+   * larger than the typical FP2 stuck-zone duration in your environment
+   * to be useful; common values are 60–120s.
+   *
+   * Note: false-positives sustained for longer than `stableForSeconds`
+   * still slip through — this is a transient-spike filter, not a fix
+   * for FP2 firmware staleness.
+   */
+  stableForSeconds?: number;
   /** Required when mode === "set-reset". Boolean expression whose rising edge sets state=true. */
   setOn?: string;
   /** Required when mode === "set-reset". Boolean expression whose rising edge sets state=false. */
@@ -138,6 +158,12 @@ export class CompositeSensor extends EventEmitter {
   private readonly doorSource?: Source;
   private readonly checkAfterMs: number;
   private readonly autoCorrectOnPresence: boolean;
+  /** Sustained-true window for door-anchor +N check. Milliseconds. 0 = legacy single-snapshot. */
+  private readonly stableForMs: number;
+  /** Last value observed on `doorSource` (undefined if never observed a non-degraded value). */
+  private lastDoorValue: boolean | undefined = undefined;
+  /** Cancel flag for the currently-running sustained-true validation, if any. */
+  private sustainedCheckCancel?: { cancelled: boolean };
   /** Set-reset mode: rising edge sets state=true. */
   private readonly setOnAst?: Ast;
   /** Set-reset mode: rising edge sets state=false. */
@@ -194,6 +220,7 @@ export class CompositeSensor extends EventEmitter {
     this.mode = config.mode ?? "reactive";
     this.checkAfterMs = Math.max(0, (config.checkAfterMinutes ?? 5) * 60_000);
     this.autoCorrectOnPresence = config.autoCorrectOnPresence ?? true;
+    this.stableForMs = Math.max(0, (config.stableForSeconds ?? 0) * 1000);
 
     if (this.mode === "set-reset") {
       if (!config.setOn || !config.resetOn) {
@@ -671,6 +698,28 @@ export class CompositeSensor extends EventEmitter {
     if (this.mode !== "door-anchor") {
       return;
     }
+    // Filter out the door source's startup-time first emit. The Source
+    // contract emits `change` whenever value OR degraded transitions, so
+    // the first real value arriving after subscribe() flips from
+    // `value=undefined, degraded=true` to `value=<bool>, degraded=false`
+    // — a legitimate Source change, but NOT a door crossing. Without this
+    // guard a homebridge restart triggers rule 5 ("door event while away
+    // → instant flip to home") even though the user hasn't moved.
+    const prev = this.lastDoorValue;
+    const curr = this.doorSource?.value;
+    this.lastDoorValue = curr;
+    if (prev === undefined || curr === undefined || prev === curr) {
+      this.platform.log.debug(
+        `Sensor "${this.config.name}" door source change ignored (prev=${prev}, curr=${curr}) — not a real transition`,
+      );
+      return;
+    }
+    // Cancel any in-flight sustained-true validation from a previous check —
+    // a fresh door event invalidates whatever the +N check was about to publish.
+    if (this.sustainedCheckCancel) {
+      this.sustainedCheckCancel.cancelled = true;
+      this.sustainedCheckCancel = undefined;
+    }
     if (!this.currentValue) {
       this.platform.log.info(
         `Sensor "${this.config.name}" door event while away — instant flip to home (rule 5)`,
@@ -710,7 +759,57 @@ export class CompositeSensor extends EventEmitter {
     this.platform.log.info(
       `Sensor "${this.config.name}" door-anchor check fired — expression=${evaluated}`,
     );
-    this.setValue(evaluated);
+    // Legacy single-snapshot path: either stableForSeconds wasn't set, or
+    // expression came back false (no need to validate a non-presence reading
+    // — false is always trustworthy in this design, only true is at risk
+    // of being a transient FP2 false-positive).
+    if (this.stableForMs === 0 || !evaluated) {
+      this.setValue(evaluated);
+      return;
+    }
+    // Sustained-true validation: defer publishing true; re-sample every
+    // 30s. If any sample drops to false, the +N hit caught a transient
+    // spike — publish false. If all samples through stableForMs stay true,
+    // publish true. A new door event mid-validation flips `cancel.cancelled`
+    // via onDoorChange and aborts this loop.
+    const cancel = { cancelled: false };
+    this.sustainedCheckCancel = cancel;
+    this.platform.log.info(
+      `Sensor "${this.config.name}" sustained-true validation — sampling every 30s for ${this.stableForMs / 1000}s`,
+    );
+    void this.runSustainedTrueValidation(cancel);
+  }
+
+  private async runSustainedTrueValidation(cancel: { cancelled: boolean }): Promise<void> {
+    const deadline = Date.now() + this.stableForMs;
+    const sampleEveryMs = 30_000;
+    while (!cancel.cancelled && Date.now() < deadline) {
+      const wait = Math.min(sampleEveryMs, deadline - Date.now());
+      await new Promise<void>((resolve) => setTimeout(resolve, wait));
+      if (cancel.cancelled) {
+        return;
+      }
+      if (!this.evaluateOnce()) {
+        this.platform.log.info(
+          `Sensor "${this.config.name}" sustained-true validation aborted — expression went false; publishing false`,
+        );
+        if (this.sustainedCheckCancel === cancel) {
+          this.sustainedCheckCancel = undefined;
+        }
+        this.setValue(false);
+        return;
+      }
+    }
+    if (cancel.cancelled) {
+      return;
+    }
+    this.platform.log.info(
+      `Sensor "${this.config.name}" sustained-true validation passed (${this.stableForMs / 1000}s all-true) — publishing true`,
+    );
+    if (this.sustainedCheckCancel === cancel) {
+      this.sustainedCheckCancel = undefined;
+    }
+    this.setValue(true);
   }
 
   private applyDegradedPolicy(): boolean {
