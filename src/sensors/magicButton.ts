@@ -8,8 +8,12 @@ import { CompositeSensorPlatform } from "../platform.js";
  * Exposes a HomeKit Switch that, on activation, snapshots the target light's
  * current On+Brightness and writes the target's Brightness up to
  * `targetBrightness` (turning it on if needed). On deactivation, the
- * snapshot is restored verbatim — so the light returns to whatever level
- * (or off-state) it was at before the button was pressed.
+ * snapshot is restored verbatim.
+ *
+ * If the user (or any other actor) manually changes the target's brightness
+ * between activation and deactivation, the magic button interprets that as
+ * "the user has taken control" — it auto-OFFs in HomeKit and leaves the
+ * manual setting in place rather than restoring the snapshot.
  *
  * Snapshot is in-memory only. Across a Homebridge restart the snapshot is
  * lost; in that case deactivation becomes a no-op rather than guessing.
@@ -31,14 +35,21 @@ interface Snapshot {
 }
 
 /**
- * "Magic button" — a HomeKit Switch that boosts a target light to a
- * preset brightness while ON and restores the prior state on OFF.
+ * "Magic button" — a HomeKit Switch that boosts a target light to a preset
+ * brightness while ON and restores the prior state on a normal OFF.
  *
- * Behavior is intentionally non-idempotent across the OFF transition:
- * if the user manually adjusts the light's brightness between ON and OFF
- * of the magic button, the restore on OFF overrides that manual change.
- * That matches the "snapshot-and-restore" mental model (vs e.g. a diff
- * approach that would preserve manual mid-cycle changes).
+ * Manual-override semantics: if the target's brightness changes to anything
+ * OTHER than our written `targetBrightness` while the magic button is ON, we
+ * treat that as a manual intervention. The magic button auto-OFFs in
+ * HomeKit and the manual brightness setting is left in place — no restore.
+ *
+ * To distinguish our own write's echo from a genuine manual change, the
+ * listener stays in a "pre-echo" state after activation until either:
+ *   (a) it observes a brightness change equal to `targetBrightness`
+ *       (= our write settled), or
+ *   (b) a 3-second grace timer expires (some bridges optimize away no-op
+ *       writes and never emit an echo — e.g., target was already at target
+ *       brightness when activated).
  *
  * See feedback_homebridge.md §D1 for the short-circuit-no-change rule
  * applied in handleOn().
@@ -55,6 +66,11 @@ export class MagicButton {
   private snapshot?: Snapshot;
   /** Serializes ON/OFF transitions so rapid toggles don't interleave. */
   private writeInFlight = false;
+  /** Gate for treating brightness changes as manual interventions. See class docstring. */
+  private manualWatchEnabled = false;
+  /** Fallback timer that enables manualWatchEnabled if the write echo never arrives. */
+  private manualWatchTimer?: ReturnType<typeof setTimeout>;
+  private static readonly MANUAL_WATCH_FALLBACK_MS = 3000;
 
   constructor(
     private readonly platform: CompositeSensorPlatform,
@@ -96,8 +112,8 @@ export class MagicButton {
     }
 
     // Track the target's current On + Brightness so activation has fresh
-    // values to snapshot. Pure read path — no write happens until the
-    // HomeKit switch is toggled.
+    // values to snapshot. The brightness path also drives manual-override
+    // detection while the magic button is ON.
     bridge.subscribe(
       { accessory: config.accessory, characteristic: "On" },
       (v, degraded) => {
@@ -109,16 +125,44 @@ export class MagicButton {
     );
     bridge.subscribe(
       { accessory: config.accessory, characteristic: "Brightness" },
-      (v, degraded) => {
-        if (degraded) {
-          return;
-        }
-        const n = Number(v);
-        if (Number.isFinite(n)) {
-          this.targetBrightness = n;
-        }
-      },
+      (v, degraded) => this.handleBrightnessUpdate(v, degraded),
     );
+  }
+
+  private handleBrightnessUpdate(v: unknown, degraded: boolean): void {
+    if (degraded) {
+      return;
+    }
+    const n = Number(v);
+    if (!Number.isFinite(n)) {
+      return;
+    }
+    const prev = this.targetBrightness;
+    this.targetBrightness = n;
+
+    if (!this.currentOn) {
+      return;
+    }
+
+    // Pre-echo state: wait for our own write to settle before treating
+    // brightness changes as manual. Receiving exactly our targetBrightness
+    // is the echo signal; the fallback timer covers no-op-write bridges.
+    if (!this.manualWatchEnabled) {
+      if (n === this.config.targetBrightness) {
+        this.cancelManualWatchFallback();
+        this.manualWatchEnabled = true;
+      }
+      return;
+    }
+
+    // Manual-override detection: any value other than targetBrightness
+    // while the watch is enabled is interpreted as the user taking control.
+    if (n !== this.config.targetBrightness) {
+      this.platform.log.info(
+        `Magic button "${this.config.name}" detected manual brightness change (${prev} → ${n}); auto-OFF without restore`,
+      );
+      this.autoOffNoRestore();
+    }
   }
 
   private async handleOn(value: boolean): Promise<void> {
@@ -168,6 +212,11 @@ export class MagicButton {
     this.platform.log.info(
       `Magic button "${this.config.name}" activate: snapshot {on=${this.snapshot.on}, brightness=${this.snapshot.brightness}} → target brightness=${this.config.targetBrightness}`,
     );
+    // Arm the manual-watch fallback before issuing writes — covers the case
+    // where the bridge silently swallows our write (already at target) and
+    // never emits an echo we could latch onto.
+    this.manualWatchEnabled = false;
+    this.armManualWatchFallback();
     // Set On first, then Brightness. Some bridges (Loxone via
     // homebridge-loxone-control) treat Brightness writes as no-ops when
     // On is false; writing On=true first guarantees the brightness write
@@ -183,9 +232,11 @@ export class MagicButton {
   }
 
   private async deactivate(): Promise<void> {
+    this.manualWatchEnabled = false;
+    this.cancelManualWatchFallback();
     if (!this.snapshot) {
       this.platform.log.warn(
-        `Magic button "${this.config.name}" deactivating with no snapshot — leaving target as-is (was Homebridge restarted while the magic button was ON?)`,
+        `Magic button "${this.config.name}" deactivating with no snapshot — leaving target as-is (was Homebridge restarted while the magic button was ON, or did a manual override already clear the snapshot?)`,
       );
       return;
     }
@@ -207,7 +258,40 @@ export class MagicButton {
     );
   }
 
+  /**
+   * Magic button gives up on the cycle: clear snapshot, flip HomeKit's
+   * Switch to OFF (visible to the user), but do NOT write anything to the
+   * target. The manual brightness setting stays exactly as the user set it.
+   */
+  private autoOffNoRestore(): void {
+    this.snapshot = undefined;
+    this.currentOn = false;
+    this.manualWatchEnabled = false;
+    this.cancelManualWatchFallback();
+    this.service.updateCharacteristic(
+      this.platform.Characteristic.On,
+      false,
+    );
+  }
+
+  private armManualWatchFallback(): void {
+    this.cancelManualWatchFallback();
+    this.manualWatchTimer = setTimeout(() => {
+      this.manualWatchEnabled = true;
+      this.manualWatchTimer = undefined;
+    }, MagicButton.MANUAL_WATCH_FALLBACK_MS);
+    this.manualWatchTimer.unref?.();
+  }
+
+  private cancelManualWatchFallback(): void {
+    if (this.manualWatchTimer) {
+      clearTimeout(this.manualWatchTimer);
+      this.manualWatchTimer = undefined;
+    }
+  }
+
   stop(): void {
-    // Subscription lifecycle is owned by the HapBridge; nothing to release here.
+    this.cancelManualWatchFallback();
+    // Subscription lifecycle is owned by the HapBridge; nothing else to release here.
   }
 }

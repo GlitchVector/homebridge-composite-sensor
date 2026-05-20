@@ -167,20 +167,73 @@ async function testCycleWhenTargetWasOff() {
   );
 }
 
-async function testMidCycleManualChangeIsOverridden() {
-  // Per user spec: manual change while ON gets overridden by restore.
+async function testManualBrightnessChangeAutoOffsNoRestore() {
+  // New spec (2026-05-20): manual brightness change while ON auto-OFFs
+  // the magic button in HomeKit and leaves the target light untouched.
+  const { mb, bridge, accessory } = makeMagicButton({ targetBrightness: 100 });
+  bridge.push("On", true);
+  bridge.push("Brightness", 50);
+  await getOnHandler(accessory)(true);
+  // Activation writes (On=true then Brightness=100). Simulate the bridge's
+  // echo of our brightness write — this enables manualWatchEnabled.
+  bridge.push("Brightness", 100);
+  bridge.clear();
+
+  // Manual override: user drags brightness to 75. The magic button should
+  // recognize this as not our write and auto-OFF without restoring.
+  bridge.push("Brightness", 75);
+  assertEq(
+    "manual brightness change while ON: no restore writes",
+    bridge.writes,
+    [],
+  );
+  assertEq(
+    "magic button HomeKit Switch flipped to OFF after manual change",
+    accessory._svc.value,
+    false,
+  );
+
+  // Subsequent explicit OFF press should be a no-op (HomeKit short-circuit
+  // because currentOn already false; no snapshot left to restore anyway).
+  bridge.clear();
+  await getOnHandler(accessory)(false);
+  assertEq(
+    "explicit OFF after auto-off: no further writes",
+    bridge.writes,
+    [],
+  );
+}
+
+async function testPreEchoBrightnessUpdateDoesNotAutoOff() {
+  // Race: a stale brightness update arrives between activation and our
+  // write's echo. Must not trigger auto-off (manualWatchEnabled is still
+  // false in pre-echo state).
   const { mb, bridge, accessory } = makeMagicButton({ targetBrightness: 100 });
   bridge.push("On", true);
   bridge.push("Brightness", 50);
   await getOnHandler(accessory)(true);
   bridge.clear();
-  // User manually drags brightness to 75 while magic button is ON.
-  // The subscribe listener updates the cached target value — but the
-  // snapshot was already taken and should NOT be updated.
-  bridge.push("Brightness", 75);
+
+  // Pre-echo: bridge delivers the OLD brightness one more time (e.g. a
+  // watchdog refresh raced with our write).
+  bridge.push("Brightness", 50);
+  assertEq(
+    "pre-echo stale brightness update: no auto-off, no writes",
+    bridge.writes,
+    [],
+  );
+  assertEq(
+    "magic button still ON after pre-echo stale update",
+    accessory._svc.value,
+    undefined,  // FakeService.value only set when updateCharacteristic fires
+  );
+
+  // Now the real echo arrives.
+  bridge.push("Brightness", 100);
+  // And the user normally turns OFF — restore should still happen.
   await getOnHandler(accessory)(false);
   assertEq(
-    "deactivate after mid-cycle manual change: restores original 50, not 75",
+    "deactivate after pre-echo race and clean echo: restores original",
     bridge.writes,
     [{ char: "Brightness", value: 50 }, { char: "On", value: true }],
   );
@@ -271,7 +324,8 @@ async function testConfigValidatesBridgeExists() {
   await testActivationSnapshotsAndWrites();
   await testDeactivationRestoresSnapshot();
   await testCycleWhenTargetWasOff();
-  await testMidCycleManualChangeIsOverridden();
+  await testManualBrightnessChangeAutoOffsNoRestore();
+  await testPreEchoBrightnessUpdateDoesNotAutoOff();
   await testShortCircuitNoChange();
   await testNoSnapshotOnDeactivate();
   await testActivationRejectedWhenTargetUnknown();
