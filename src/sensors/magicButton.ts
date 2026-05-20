@@ -2,18 +2,35 @@ import { CharacteristicValue, PlatformAccessory, Service } from "homebridge";
 import { HapBridge } from "../sources/hapBridge.js";
 import { CompositeSensorPlatform } from "../platform.js";
 
+type CharValue = boolean | number | string;
+
 /**
  * Config shape for a magic-button accessory.
  *
- * Exposes a HomeKit Switch that, on activation, snapshots the target light's
- * current On+Brightness and writes the target's Brightness up to
- * `targetBrightness` (turning it on if needed). On deactivation, the
- * snapshot is restored verbatim.
+ * Exposes a HomeKit Switch that, on activation, snapshots the target
+ * accessory's current values for a set of characteristics and writes the
+ * configured target values. On deactivation, the snapshot is restored
+ * verbatim.
+ *
+ * Two equivalent ways to specify what to write:
+ *
+ *  1. `targetBrightness: N` (legacy shortcut) — equivalent to
+ *     `target: { On: true, Brightness: N }`. Kept for backward-compat with
+ *     0.10.x configs.
+ *
+ *  2. `target: { On: true, Brightness: 100, Hue: 0, Saturation: 100 }` —
+ *     arbitrary HAP characteristic names → values. All listed characteristics
+ *     are snapshotted on activation and restored on deactivation. Use this
+ *     for color lamps (Hue, Saturation, ColorTemperature, ...).
+ *
+ * Exactly one of `targetBrightness` and `target` must be set.
  *
  * If the user (or any other actor) manually changes the target's brightness
  * between activation and deactivation, the magic button interprets that as
  * "the user has taken control" — it auto-OFFs in HomeKit and leaves the
- * manual setting in place rather than restoring the snapshot.
+ * manual setting in place rather than restoring the snapshot. Manual-override
+ * detection is brightness-only; manual hue/saturation changes mid-cycle
+ * don't trigger auto-off (use case: color tuning while a scene is held).
  *
  * Snapshot is in-memory only. Across a Homebridge restart the snapshot is
  * lost; in that case deactivation becomes a no-op rather than guessing.
@@ -25,31 +42,42 @@ export interface MagicButtonConfig {
   bridge: string;
   /** Accessory identifier on that bridge — display name (serviceName) or numeric AID. */
   accessory: string | number;
-  /** Brightness to set on activation (0-100, HomeKit scale). */
-  targetBrightness: number;
+  /**
+   * Legacy single-characteristic shortcut — sugar for
+   * `target: { On: true, Brightness: N }`. 0-100 HomeKit scale.
+   */
+  targetBrightness?: number;
+  /**
+   * General target: HAP characteristic name → value, all snapshotted on
+   * activation and restored on deactivation. Mutually exclusive with
+   * `targetBrightness`.
+   */
+  target?: Record<string, CharValue>;
 }
 
 interface Snapshot {
-  on: boolean;
-  brightness: number;
+  values: Record<string, CharValue>;
 }
 
 /**
- * "Magic button" — a HomeKit Switch that boosts a target light to a preset
- * brightness while ON and restores the prior state on a normal OFF.
+ * "Magic button" — a HomeKit Switch that boosts a target accessory to a
+ * preset state while ON and restores the prior state on a normal OFF.
  *
- * Manual-override semantics: if the target's brightness changes to anything
- * OTHER than our written `targetBrightness` while the magic button is ON, we
- * treat that as a manual intervention. The magic button auto-OFFs in
- * HomeKit and the manual brightness setting is left in place — no restore.
+ * Generalized in 0.10.3 from brightness-only to arbitrary characteristic
+ * set, so the same machinery handles "boost to 100% brightness" and "set
+ * to green at full saturation" with one config form.
  *
- * To distinguish our own write's echo from a genuine manual change, the
- * listener stays in a "pre-echo" state after activation until either:
- *   (a) it observes a brightness change equal to `targetBrightness`
- *       (= our write settled), or
- *   (b) a 3-second grace timer expires (some bridges optimize away no-op
- *       writes and never emit an echo — e.g., target was already at target
- *       brightness when activated).
+ * Manual-override semantics: if Brightness is one of the target keys AND
+ * the lamp's brightness changes to anything OTHER than our written value
+ * while the magic button is ON, that's treated as a manual intervention →
+ * auto-OFF the switch in HomeKit, leave the lamp alone. Other
+ * characteristics (Hue, Saturation, ColorTemperature, ...) don't trigger
+ * auto-off because color tweaks during a held scene are normal.
+ *
+ * Pre-echo state: from activation until we observe our own brightness echo
+ * (or a 3s fallback timer fires), brightness changes are ignored — prevents
+ * a watchdog-refresh-of-stale-value race from immediately auto-OFFing the
+ * button we just turned on.
  *
  * See feedback_homebridge.md §D1 for the short-circuit-no-change rule
  * applied in handleOn().
@@ -57,16 +85,15 @@ interface Snapshot {
 export class MagicButton {
   private readonly service: Service;
   private readonly bridge: HapBridge;
+  private readonly target: Record<string, CharValue>;
   private currentOn = false;
-  /** Latest known On of the target — populated by the bridge subscribe. */
-  private targetOn: boolean | undefined;
-  /** Latest known Brightness of the target — populated by the bridge subscribe. */
-  private targetBrightness: number | undefined;
+  /** Latest known value per target characteristic — populated by bridge subscribes. */
+  private readonly lastKnown: Record<string, CharValue | undefined> = {};
   /** In-memory snapshot taken on activation; cleared on deactivation. */
   private snapshot?: Snapshot;
   /** Serializes ON/OFF transitions so rapid toggles don't interleave. */
   private writeInFlight = false;
-  /** Gate for treating brightness changes as manual interventions. See class docstring. */
+  /** Gate for treating brightness changes as manual interventions. */
   private manualWatchEnabled = false;
   /** Fallback timer that enables manualWatchEnabled if the write echo never arrives. */
   private manualWatchTimer?: ReturnType<typeof setTimeout>;
@@ -100,66 +127,99 @@ export class MagicButton {
     }
     this.bridge = bridge;
 
-    if (
-      typeof config.targetBrightness !== "number"
-      || !Number.isFinite(config.targetBrightness)
-      || config.targetBrightness < 0
-      || config.targetBrightness > 100
-    ) {
-      throw new Error(
-        `Magic button "${config.name}" requires targetBrightness in [0,100], got ${JSON.stringify(config.targetBrightness)}`,
+    this.target = this.resolveTarget(config);
+
+    // Subscribe to every characteristic we'll snapshot+write, so we always
+    // have a current value cached when the user toggles the switch.
+    for (const char of Object.keys(this.target)) {
+      bridge.subscribe(
+        { accessory: config.accessory, characteristic: char },
+        (v, degraded) => this.handleSourceUpdate(char, v, degraded),
       );
     }
+  }
 
-    // Track the target's current On + Brightness so activation has fresh
-    // values to snapshot. The brightness path also drives manual-override
-    // detection while the magic button is ON.
-    bridge.subscribe(
-      { accessory: config.accessory, characteristic: "On" },
-      (v, degraded) => {
-        if (degraded) {
-          return;
-        }
-        this.targetOn = Boolean(v);
-      },
-    );
-    bridge.subscribe(
-      { accessory: config.accessory, characteristic: "Brightness" },
-      (v, degraded) => this.handleBrightnessUpdate(v, degraded),
+  /**
+   * Normalize the config's `target` / `targetBrightness` fields into the
+   * unified `Record<string, CharValue>` form used everywhere downstream.
+   * Validates here so config errors surface at platform bootstrap, not later
+   * when the user presses the switch.
+   */
+  private resolveTarget(config: MagicButtonConfig): Record<string, CharValue> {
+    const hasTarget = config.target !== undefined && config.target !== null;
+    const hasShortcut = config.targetBrightness !== undefined;
+    if (hasTarget && hasShortcut) {
+      throw new Error(
+        `Magic button "${config.name}": set either \`target\` or \`targetBrightness\`, not both`,
+      );
+    }
+    if (hasTarget) {
+      const t = config.target as Record<string, CharValue>;
+      if (typeof t !== "object" || Array.isArray(t) || Object.keys(t).length === 0) {
+        throw new Error(
+          `Magic button "${config.name}" \`target\` must be a non-empty object of {Characteristic: value} pairs`,
+        );
+      }
+      return { ...t };
+    }
+    if (hasShortcut) {
+      const n = config.targetBrightness as number;
+      if (typeof n !== "number" || !Number.isFinite(n) || n < 0 || n > 100) {
+        throw new Error(
+          `Magic button "${config.name}" requires targetBrightness in [0,100], got ${JSON.stringify(n)}`,
+        );
+      }
+      return { On: true, Brightness: n };
+    }
+    throw new Error(
+      `Magic button "${config.name}" requires either \`targetBrightness\` or \`target\``,
     );
   }
 
-  private handleBrightnessUpdate(v: unknown, degraded: boolean): void {
+  private handleSourceUpdate(char: string, v: unknown, degraded: boolean): void {
     if (degraded) {
+      return;
+    }
+    // Cache the latest value so the next activation snapshot has it.
+    this.lastKnown[char] = v as CharValue;
+    // Brightness specifically drives manual-override detection.
+    if (char === "Brightness") {
+      this.handleBrightnessUpdate(v);
+    }
+  }
+
+  private handleBrightnessUpdate(v: unknown): void {
+    if (!("Brightness" in this.target)) {
       return;
     }
     const n = Number(v);
     if (!Number.isFinite(n)) {
       return;
     }
-    const prev = this.targetBrightness;
-    this.targetBrightness = n;
 
     if (!this.currentOn) {
       return;
     }
 
+    const targetBrightness = this.target.Brightness as number;
+
     // Pre-echo state: wait for our own write to settle before treating
-    // brightness changes as manual. Receiving exactly our targetBrightness
+    // brightness changes as manual. Receiving exactly our target brightness
     // is the echo signal; the fallback timer covers no-op-write bridges.
     if (!this.manualWatchEnabled) {
-      if (n === this.config.targetBrightness) {
+      if (n === targetBrightness) {
         this.cancelManualWatchFallback();
         this.manualWatchEnabled = true;
       }
       return;
     }
 
-    // Manual-override detection: any value other than targetBrightness
+    // Manual-override detection: any value other than our target brightness
     // while the watch is enabled is interpreted as the user taking control.
-    if (n !== this.config.targetBrightness) {
+    if (n !== targetBrightness) {
       this.platform.log.info(
-        `Magic button "${this.config.name}" detected manual brightness change (${prev} → ${n}); auto-OFF without restore`,
+        `Magic button "${this.config.name}" detected manual brightness change `
+          + `(→ ${n}); auto-OFF without restore`,
       );
       this.autoOffNoRestore();
     }
@@ -200,37 +260,51 @@ export class MagicButton {
   }
 
   private async activate(): Promise<void> {
-    if (this.targetOn === undefined || this.targetBrightness === undefined) {
+    const missing = Object.keys(this.target).filter(
+      (k) => this.lastKnown[k] === undefined,
+    );
+    if (missing.length > 0) {
       throw new Error(
-        `Magic button "${this.config.name}": target On/Brightness not yet known — bridge subscribe still degraded?`,
+        `Magic button "${this.config.name}": target characteristic(s) `
+          + `${missing.join(", ")} not yet known — bridge subscribe still degraded?`,
       );
     }
-    this.snapshot = {
-      on: this.targetOn,
-      brightness: this.targetBrightness,
-    };
+    // Snapshot only the keys we'll write, so deactivate's restore is
+    // perfectly symmetric.
+    const snap: Record<string, CharValue> = {};
+    for (const k of Object.keys(this.target)) {
+      snap[k] = this.lastKnown[k] as CharValue;
+    }
+    this.snapshot = { values: snap };
     this.platform.log.info(
       `Magic button "${this.config.name}" activate: `
-        + `snapshot {on=${this.snapshot.on}, brightness=${this.snapshot.brightness}} `
-        + `→ target brightness=${this.config.targetBrightness}`,
+        + `snapshot=${JSON.stringify(snap)} → target=${JSON.stringify(this.target)}`,
     );
     // Arm the manual-watch fallback before issuing writes — covers the case
-    // where the bridge silently swallows our write (already at target) and
-    // never emits an echo we could latch onto.
+    // where the bridge silently swallows our brightness write (already at
+    // target) and never emits an echo we could latch onto.
     this.manualWatchEnabled = false;
     this.armManualWatchFallback();
-    // Set On first, then Brightness. Some bridges (Loxone via
-    // homebridge-loxone-control) treat Brightness writes as no-ops when
-    // On is false; writing On=true first guarantees the brightness write
-    // actually lands.
-    await this.bridge.write(
-      { accessory: this.config.accessory, characteristic: "On" },
-      true,
-    );
-    await this.bridge.write(
-      { accessory: this.config.accessory, characteristic: "Brightness" },
-      this.config.targetBrightness,
-    );
+
+    // Write On first (if present) so subsequent characteristic writes are
+    // accepted by bridges that no-op when On is false (e.g., Loxone via
+    // homebridge-loxone-control treats Brightness on an off lamp as a memory
+    // of brightness, not a "turn on at N").
+    if ("On" in this.target) {
+      await this.bridge.write(
+        { accessory: this.config.accessory, characteristic: "On" },
+        this.target.On,
+      );
+    }
+    for (const [char, value] of Object.entries(this.target)) {
+      if (char === "On") {
+        continue;
+      }
+      await this.bridge.write(
+        { accessory: this.config.accessory, characteristic: char },
+        value,
+      );
+    }
   }
 
   private async deactivate(): Promise<void> {
@@ -245,22 +319,29 @@ export class MagicButton {
       );
       return;
     }
-    const snap = this.snapshot;
+    const snap = this.snapshot.values;
     this.snapshot = undefined;
     this.platform.log.info(
-      `Magic button "${this.config.name}" deactivate: restore {on=${snap.on}, brightness=${snap.brightness}}`,
+      `Magic button "${this.config.name}" deactivate: restore ${JSON.stringify(snap)}`,
     );
-    // Restore Brightness before On — so when On goes false the target
-    // remembers the snapshot brightness as its "last brightness" rather
-    // than the boosted target value.
-    await this.bridge.write(
-      { accessory: this.config.accessory, characteristic: "Brightness" },
-      snap.brightness,
-    );
-    await this.bridge.write(
-      { accessory: this.config.accessory, characteristic: "On" },
-      snap.on,
-    );
+
+    // Write non-On chars first so when On goes false (last) the target's
+    // "remembered" state is the original brightness/hue/etc., not our boost.
+    for (const [char, value] of Object.entries(snap)) {
+      if (char === "On") {
+        continue;
+      }
+      await this.bridge.write(
+        { accessory: this.config.accessory, characteristic: char },
+        value,
+      );
+    }
+    if ("On" in snap) {
+      await this.bridge.write(
+        { accessory: this.config.accessory, characteristic: "On" },
+        snap.On,
+      );
+    }
   }
 
   /**

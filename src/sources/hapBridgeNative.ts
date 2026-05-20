@@ -44,6 +44,9 @@ interface StoredPairing {
 const SHORT_NAMES: Record<string, string> = {
   On: "25",
   Brightness: "8",
+  Hue: "13",
+  Saturation: "2F",
+  ColorTemperature: "CE",
   MotionDetected: "22",
   OccupancyDetected: "71",
   ContactSensorState: "6A",

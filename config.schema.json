@@ -137,12 +137,18 @@
               "condition": { "functionBody": "return model.sensors && model.sensors[arrayIndices[0]] && model.sensors[arrayIndices[0]].service === 'light';" }
             },
             "targetBrightness": {
-              "title": "Target brightness when activated (0-100)",
+              "title": "Target brightness when activated (0-100) — legacy shortcut for `target: { On: true, Brightness: N }`",
               "type": "integer",
               "minimum": 0,
               "maximum": 100,
-              "default": 100,
-              "description": "Magic button only — brightness to set when the switch is turned ON. Previous Brightness+On are snapshotted and restored on OFF.",
+              "description": "Magic button only — brightness to set when the switch is turned ON. Previous Brightness+On are snapshotted and restored on OFF. Mutually exclusive with `target`.",
+              "condition": { "functionBody": "return model.sensors && model.sensors[arrayIndices[0]] && model.sensors[arrayIndices[0]].service === 'magic_button';" }
+            },
+            "target": {
+              "title": "Target state when activated — {Characteristic: value} pairs",
+              "type": "object",
+              "description": "Magic button only — set of HAP characteristic name → value pairs to write on activation. All listed characteristics are snapshotted and restored on OFF. Common keys: On, Brightness, Hue (0-360), Saturation (0-100), ColorTemperature (140-500). Mutually exclusive with `targetBrightness`.",
+              "additionalProperties": true,
               "condition": { "functionBody": "return model.sensors && model.sensors[arrayIndices[0]] && model.sensors[arrayIndices[0]].service === 'magic_button';" }
             },
             "holdSeconds": {

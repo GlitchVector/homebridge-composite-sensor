@@ -102,12 +102,16 @@ function makeMagicButton(opts = {}) {
   const bridge = new FakeBridge();
   const bridges = new Map([["loxone", bridge]]);
   const config = {
-    name: "Kitchen Boost",
+    name: opts.name ?? "Kitchen Boost",
     service: "magic_button",
     bridge: "loxone",
-    accessory: "Kitchen Spotlight",
-    targetBrightness: opts.targetBrightness ?? 100,
+    accessory: opts.accessory ?? "Kitchen Spotlight",
   };
+  if (opts.target !== undefined) {
+    config.target = opts.target;
+  } else {
+    config.targetBrightness = opts.targetBrightness ?? 100;
+  }
   const mb = new MagicButton(platform, accessory, config, bridges);
   return { mb, bridge, accessory, platform };
 }
@@ -302,6 +306,159 @@ async function testConfigValidatesTargetBrightnessRange() {
   assertEq("targetBrightness=200 rejected", threw, true);
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// Multi-characteristic target tests (added 0.10.3)
+// ──────────────────────────────────────────────────────────────────────────
+
+async function testColorTargetActivateWritesAllChars() {
+  const { bridge, accessory } = makeMagicButton({
+    target: { On: true, Brightness: 100, Hue: 120, Saturation: 100 },
+  });
+  // Seed current state of all 4 chars
+  bridge.push("On", true);
+  bridge.push("Brightness", 50);
+  bridge.push("Hue", 0);
+  bridge.push("Saturation", 0);
+  await getOnHandler(accessory)(true);
+  // Expected: On first (config order), then the remaining 3 in config order.
+  assertEq(
+    "color activate: writes On + Brightness + Hue + Saturation",
+    bridge.writes,
+    [
+      { char: "On", value: true },
+      { char: "Brightness", value: 100 },
+      { char: "Hue", value: 120 },
+      { char: "Saturation", value: 100 },
+    ],
+  );
+}
+
+async function testColorTargetDeactivateRestoresAllChars() {
+  const { bridge, accessory } = makeMagicButton({
+    target: { On: true, Brightness: 100, Hue: 120, Saturation: 100 },
+  });
+  bridge.push("On", true);
+  bridge.push("Brightness", 50);
+  bridge.push("Hue", 0);
+  bridge.push("Saturation", 0);
+  await getOnHandler(accessory)(true);
+  bridge.clear();
+  await getOnHandler(accessory)(false);
+  // Restore non-On chars first (config order), then On last.
+  assertEq(
+    "color deactivate: restores Brightness + Hue + Saturation, then On",
+    bridge.writes,
+    [
+      { char: "Brightness", value: 50 },
+      { char: "Hue", value: 0 },
+      { char: "Saturation", value: 0 },
+      { char: "On", value: true },
+    ],
+  );
+}
+
+async function testColorTargetManualHueChangeDoesNotAutoOff() {
+  const { bridge, accessory } = makeMagicButton({
+    target: { On: true, Brightness: 100, Hue: 120, Saturation: 100 },
+  });
+  bridge.push("On", true);
+  bridge.push("Brightness", 50);
+  bridge.push("Hue", 0);
+  bridge.push("Saturation", 0);
+  await getOnHandler(accessory)(true);
+  bridge.push("Brightness", 100); // echo of our write — enables manualWatch
+  bridge.clear();
+
+  // User manually shifts hue 120 → 200 — magic button should ignore.
+  bridge.push("Hue", 200);
+  assertEq(
+    "manual hue change: no auto-off, no writes",
+    bridge.writes,
+    [],
+  );
+  assertEq(
+    "magic button still ON after manual hue change",
+    accessory._svc.value,
+    undefined,
+  );
+}
+
+async function testColorTargetManualBrightnessChangeStillAutoOffs() {
+  const { bridge, accessory } = makeMagicButton({
+    target: { On: true, Brightness: 100, Hue: 120, Saturation: 100 },
+  });
+  bridge.push("On", true);
+  bridge.push("Brightness", 50);
+  bridge.push("Hue", 0);
+  bridge.push("Saturation", 0);
+  await getOnHandler(accessory)(true);
+  bridge.push("Brightness", 100); // echo enables manualWatch
+  bridge.clear();
+
+  bridge.push("Brightness", 75); // manual change
+  assertEq(
+    "manual brightness change while ON (color target): auto-OFF, no writes",
+    bridge.writes,
+    [],
+  );
+  assertEq(
+    "HomeKit Switch flipped to OFF",
+    accessory._svc.value,
+    false,
+  );
+}
+
+async function testConfigRejectsBothTargetAndShortcut() {
+  const platform = makePlatform();
+  const accessory = fakeAccessory();
+  const bridge = new FakeBridge();
+  const bridges = new Map([["loxone", bridge]]);
+  let threw = false;
+  try {
+    new MagicButton(platform, accessory, {
+      name: "X", service: "magic_button", bridge: "loxone",
+      accessory: "Y", targetBrightness: 100, target: { On: true },
+    }, bridges);
+  } catch (e) {
+    threw = /not both/.test(e.message);
+  }
+  assertEq("both target+targetBrightness rejected", threw, true);
+}
+
+async function testConfigRejectsEmptyTarget() {
+  const platform = makePlatform();
+  const accessory = fakeAccessory();
+  const bridge = new FakeBridge();
+  const bridges = new Map([["loxone", bridge]]);
+  let threw = false;
+  try {
+    new MagicButton(platform, accessory, {
+      name: "X", service: "magic_button", bridge: "loxone",
+      accessory: "Y", target: {},
+    }, bridges);
+  } catch (e) {
+    threw = /non-empty object/.test(e.message);
+  }
+  assertEq("empty target object rejected", threw, true);
+}
+
+async function testConfigRejectsNeither() {
+  const platform = makePlatform();
+  const accessory = fakeAccessory();
+  const bridge = new FakeBridge();
+  const bridges = new Map([["loxone", bridge]]);
+  let threw = false;
+  try {
+    new MagicButton(platform, accessory, {
+      name: "X", service: "magic_button", bridge: "loxone",
+      accessory: "Y",
+    }, bridges);
+  } catch (e) {
+    threw = /requires either/.test(e.message);
+  }
+  assertEq("neither target nor targetBrightness rejected", threw, true);
+}
+
 async function testConfigValidatesBridgeExists() {
   const platform = makePlatform();
   const accessory = fakeAccessory();
@@ -330,6 +487,13 @@ async function testConfigValidatesBridgeExists() {
   await testNoSnapshotOnDeactivate();
   await testActivationRejectedWhenTargetUnknown();
   await testConfigValidatesTargetBrightnessRange();
+  await testColorTargetActivateWritesAllChars();
+  await testColorTargetDeactivateRestoresAllChars();
+  await testColorTargetManualHueChangeDoesNotAutoOff();
+  await testColorTargetManualBrightnessChangeStillAutoOffs();
+  await testConfigRejectsBothTargetAndShortcut();
+  await testConfigRejectsEmptyTarget();
+  await testConfigRejectsNeither();
   await testConfigValidatesBridgeExists();
 
   if (failed > 0) {
