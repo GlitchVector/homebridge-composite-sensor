@@ -53,6 +53,18 @@ export interface MagicButtonConfig {
    * `targetBrightness`.
    */
   target?: Record<string, CharValue>;
+  /**
+   * When true, the button ignores manual state changes on the target light
+   * while ON — it stays active until the user explicitly OFFs the switch,
+   * and then restores the snapshot taken at activation. Default false
+   * (= auto-OFF on manual brightness change, today's behavior).
+   *
+   * Use this when you want the magic button to "hold" a scene against
+   * incidental brightness drift (Hue scene picker re-emits values, dimmer
+   * tap, etc.). The snapshot itself is one-shot regardless of sticky —
+   * sticky only controls whether the auto-OFF heuristic runs.
+   */
+  sticky?: boolean;
 }
 
 interface Snapshot {
@@ -192,6 +204,10 @@ export class MagicButton {
     if (!("Brightness" in this.target)) {
       return;
     }
+    // Sticky mode: never auto-OFF on manual brightness change.
+    if (this.config.sticky === true) {
+      return;
+    }
     const n = Number(v);
     if (!Number.isFinite(n)) {
       return;
@@ -282,9 +298,12 @@ export class MagicButton {
     );
     // Arm the manual-watch fallback before issuing writes — covers the case
     // where the bridge silently swallows our brightness write (already at
-    // target) and never emits an echo we could latch onto.
+    // target) and never emits an echo we could latch onto. Skip entirely
+    // in sticky mode: the watch never fires anyway, no point burning a timer.
     this.manualWatchEnabled = false;
-    this.armManualWatchFallback();
+    if (this.config.sticky !== true) {
+      this.armManualWatchFallback();
+    }
 
     // Write On first (if present) so subsequent characteristic writes are
     // accepted by bridges that no-op when On is false (e.g., Loxone via

@@ -151,6 +151,13 @@
               "additionalProperties": true,
               "condition": { "functionBody": "return model.sensors && model.sensors[arrayIndices[0]] && model.sensors[arrayIndices[0]].service === 'magic_button';" }
             },
+            "sticky": {
+              "title": "Sticky — ignore manual changes on the target while ON",
+              "type": "boolean",
+              "default": false,
+              "description": "Magic button only — when true, manual brightness changes on the target light do NOT auto-OFF the button. The snapshot taken at activation is restored verbatim on OFF, ignoring any mid-cycle drift. Default false (auto-OFF on manual brightness change).",
+              "condition": { "functionBody": "return model.sensors && model.sensors[arrayIndices[0]] && model.sensors[arrayIndices[0]].service === 'magic_button';" }
+            },
             "holdSeconds": {
               "title": "Hold seconds on true→false",
               "type": "integer",

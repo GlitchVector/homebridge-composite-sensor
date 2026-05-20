@@ -112,6 +112,9 @@ function makeMagicButton(opts = {}) {
   } else {
     config.targetBrightness = opts.targetBrightness ?? 100;
   }
+  if (opts.sticky !== undefined) {
+    config.sticky = opts.sticky;
+  }
   const mb = new MagicButton(platform, accessory, config, bridges);
   return { mb, bridge, accessory, platform };
 }
@@ -408,6 +411,88 @@ async function testColorTargetManualBrightnessChangeStillAutoOffs() {
   );
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// Sticky mode tests (added 0.10.5)
+// ──────────────────────────────────────────────────────────────────────────
+
+async function testStickyIgnoresManualBrightnessChange() {
+  const { bridge, accessory } = makeMagicButton({ targetBrightness: 100, sticky: true });
+  bridge.push("On", true);
+  bridge.push("Brightness", 50);
+  await getOnHandler(accessory)(true);
+  // Echo would normally enable manualWatch — in sticky mode it doesn't matter.
+  bridge.push("Brightness", 100);
+  bridge.clear();
+
+  // User manually drags brightness to 75 — must NOT auto-OFF.
+  bridge.push("Brightness", 75);
+  assertEq(
+    "sticky: manual brightness change → no auto-off, no writes",
+    bridge.writes,
+    [],
+  );
+  assertEq(
+    "sticky: HomeKit Switch still ON after manual change",
+    accessory._svc.value,
+    undefined,
+  );
+}
+
+async function testStickyDeactivateRestoresOriginalSnapshot() {
+  const { bridge, accessory } = makeMagicButton({ targetBrightness: 100, sticky: true });
+  bridge.push("On", true);
+  bridge.push("Brightness", 50);
+  await getOnHandler(accessory)(true);
+  bridge.clear();
+
+  // Manual mid-cycle change: lastKnown updates but snapshot stays pristine.
+  bridge.push("Brightness", 75);
+  bridge.push("Brightness", 80);
+
+  await getOnHandler(accessory)(false);
+  // Restore must use the ORIGINAL snapshot (50/true), not the latest seen (80).
+  assertEq(
+    "sticky deactivate: restores original snapshot (50/true), not latest seen (80)",
+    bridge.writes,
+    [{ char: "Brightness", value: 50 }, { char: "On", value: true }],
+  );
+}
+
+async function testStickyWithColorTarget() {
+  const { bridge, accessory } = makeMagicButton({
+    target: { On: true, Brightness: 100, Hue: 120, Saturation: 100 },
+    sticky: true,
+  });
+  bridge.push("On", true);
+  bridge.push("Brightness", 50);
+  bridge.push("Hue", 0);
+  bridge.push("Saturation", 0);
+  await getOnHandler(accessory)(true);
+  bridge.clear();
+
+  // Manual brightness AND color tweak — both ignored.
+  bridge.push("Brightness", 75);
+  bridge.push("Hue", 300);
+  assertEq(
+    "sticky color: manual brightness+hue change → no auto-off, no writes",
+    bridge.writes,
+    [],
+  );
+
+  await getOnHandler(accessory)(false);
+  // Restore: original snapshot (Brightness:50, Hue:0, Saturation:0), On last.
+  assertEq(
+    "sticky color deactivate: restores original snapshot ignoring mid-cycle drift",
+    bridge.writes,
+    [
+      { char: "Brightness", value: 50 },
+      { char: "Hue", value: 0 },
+      { char: "Saturation", value: 0 },
+      { char: "On", value: true },
+    ],
+  );
+}
+
 async function testConfigRejectsBothTargetAndShortcut() {
   const platform = makePlatform();
   const accessory = fakeAccessory();
@@ -491,6 +576,9 @@ async function testConfigValidatesBridgeExists() {
   await testColorTargetDeactivateRestoresAllChars();
   await testColorTargetManualHueChangeDoesNotAutoOff();
   await testColorTargetManualBrightnessChangeStillAutoOffs();
+  await testStickyIgnoresManualBrightnessChange();
+  await testStickyDeactivateRestoresOriginalSnapshot();
+  await testStickyWithColorTarget();
   await testConfigRejectsBothTargetAndShortcut();
   await testConfigRejectsEmptyTarget();
   await testConfigRejectsNeither();
