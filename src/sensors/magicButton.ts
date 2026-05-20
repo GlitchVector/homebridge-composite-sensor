@@ -210,7 +210,9 @@ export class MagicButton {
       brightness: this.targetBrightness,
     };
     this.platform.log.info(
-      `Magic button "${this.config.name}" activate: snapshot {on=${this.snapshot.on}, brightness=${this.snapshot.brightness}} → target brightness=${this.config.targetBrightness}`,
+      `Magic button "${this.config.name}" activate: `
+        + `snapshot {on=${this.snapshot.on}, brightness=${this.snapshot.brightness}} `
+        + `→ target brightness=${this.config.targetBrightness}`,
     );
     // Arm the manual-watch fallback before issuing writes — covers the case
     // where the bridge silently swallows our write (already at target) and
@@ -236,7 +238,10 @@ export class MagicButton {
     this.cancelManualWatchFallback();
     if (!this.snapshot) {
       this.platform.log.warn(
-        `Magic button "${this.config.name}" deactivating with no snapshot — leaving target as-is (was Homebridge restarted while the magic button was ON, or did a manual override already clear the snapshot?)`,
+        `Magic button "${this.config.name}" deactivating with no snapshot `
+          + "— leaving target as-is (was Homebridge restarted while the "
+          + "magic button was ON, or did a manual override already clear "
+          + "the snapshot?)",
       );
       return;
     }
