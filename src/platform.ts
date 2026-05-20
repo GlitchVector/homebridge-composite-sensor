@@ -167,9 +167,10 @@ export class CompositeSensorPlatform implements DynamicPlatformPlugin {
         }
       } else if (sensorConfig.service === "magic_button") {
         const cfg = sensorConfig as MagicButtonConfig;
-        if (!cfg.bridge || cfg.accessory === undefined || cfg.targetBrightness === undefined) {
+        if (!cfg.bridge || cfg.accessory === undefined
+            || (cfg.targetBrightness === undefined && cfg.target === undefined)) {
           this.log.error(
-            `magic_button "${sensorConfig.name}" requires bridge, accessory and targetBrightness`,
+            `magic_button "${sensorConfig.name}" requires bridge, accessory and either targetBrightness or target`,
           );
           continue;
         }
