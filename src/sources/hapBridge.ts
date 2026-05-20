@@ -122,4 +122,21 @@ export class HapBridge extends EventEmitter {
       listener,
     );
   }
+
+  /**
+   * Write a value to a HAP characteristic on a paired accessory. Resolves
+   * matcher (name|aid, name|iid) → (aid, iid) against the current service
+   * snapshot and delegates to the underlying transport. Rejects if the
+   * accessory or characteristic can't be located, or the write fails on
+   * the wire.
+   */
+  async write(matcher: CharacteristicMatcher, value: unknown): Promise<void> {
+    await this.impl.write(
+      {
+        accessory: coerceIdent(matcher.accessory),
+        characteristic: coerceIdent(matcher.characteristic),
+      },
+      value,
+    );
+  }
 }

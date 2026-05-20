@@ -43,6 +43,7 @@ interface StoredPairing {
  */
 const SHORT_NAMES: Record<string, string> = {
   On: "25",
+  Brightness: "8",
   MotionDetected: "22",
   OccupancyDetected: "71",
   ContactSensorState: "6A",
@@ -57,7 +58,10 @@ function matchesCharacteristicName(type: string, name: string | number): boolean
   if (!short) {
     return false;
   }
-  return type.toUpperCase() === short || type.toUpperCase().startsWith(`000000${short}-`);
+  // HAP UUIDs are 8 hex digits before the first dash — pad to that length so
+  // single-hex short names (e.g. Brightness=8 → 00000008-…) match correctly.
+  return type.toUpperCase() === short
+    || type.toUpperCase().startsWith(`${short.padStart(8, "0")}-`);
 }
 
 /**
@@ -177,6 +181,58 @@ export class NativeHapBridge extends EventEmitter {
       this.resolveAndBind({ matcher, listener });
       void this.ensureSubscriptionsCurrent();
     }
+  }
+
+  async write(matcher: CharacteristicMatcher, value: unknown): Promise<void> {
+    const client = this.client;
+    if (!client) {
+      throw new Error(`HAP bridge "${this.config.name}": not connected`);
+    }
+    if (!this.discovered) {
+      throw new Error(
+        `HAP bridge "${this.config.name}": services not yet discovered — write of "${matcher.characteristic}" on "${matcher.accessory}" rejected`,
+      );
+    }
+    const located = this.locate(matcher);
+    if (!located) {
+      throw new Error(
+        `HAP bridge "${this.config.name}": could not locate accessory "${matcher.accessory}" / characteristic "${matcher.characteristic}" for write`,
+      );
+    }
+    const { aid, iid } = located;
+    // hap-controller setCharacteristics expects { "<aid>.<iid>": value }
+    await client.setCharacteristics({ [`${aid}.${iid}`]: value });
+  }
+
+  /**
+   * Resolve a (accessory, characteristic) matcher against the current service
+   * snapshot. Returns (aid, iid) for downstream write/subscribe operations.
+   */
+  private locate(
+    matcher: CharacteristicMatcher,
+  ): { aid: number; iid: number } | undefined {
+    const accIdent = matcher.accessory;
+    const chIdent = matcher.characteristic;
+    const matches = this.services.filter((svc) => {
+      if (typeof accIdent === "number") {
+        return svc.aid === accIdent;
+      }
+      return svc.serviceName === accIdent;
+    });
+    for (const svc of matches) {
+      for (const ch of svc.serviceCharacteristics) {
+        const isMatch =
+          typeof chIdent === "number"
+            ? ch.iid === chIdent
+            : ch.description === chIdent
+              || ch.type === chIdent
+              || matchesCharacteristicName(ch.type, chIdent);
+        if (isMatch) {
+          return { aid: svc.aid, iid: ch.iid };
+        }
+      }
+    }
+    return undefined;
   }
 
   private pairingFilePath(): string {

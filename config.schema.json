@@ -107,7 +107,8 @@
                 { "title": "Motion", "enum": ["motion"] },
                 { "title": "Occupancy", "enum": ["occupancy"] },
                 { "title": "Contact", "enum": ["contact"] },
-                { "title": "Light (numeric passthrough — single HAP characteristic → CurrentAmbientLightLevel)", "enum": ["light"] }
+                { "title": "Light (numeric passthrough — single HAP characteristic → CurrentAmbientLightLevel)", "enum": ["light"] },
+                { "title": "Magic button (Switch that snapshots+restores a brightness-capable target light)", "enum": ["magic_button"] }
               ]
             },
             "expression": {
@@ -120,20 +121,29 @@
             "bridge": {
               "title": "HAP bridge name",
               "type": "string",
-              "description": "Light sensor only — the hapBridges entry to read from.",
-              "condition": { "functionBody": "return model.sensors && model.sensors[arrayIndices[0]] && model.sensors[arrayIndices[0]].service === 'light';" }
+              "description": "hapBridges entry to read (light sensor) or read+write (magic button).",
+              "condition": { "functionBody": "var s = model.sensors && model.sensors[arrayIndices[0]] && model.sensors[arrayIndices[0]].service; return s === 'light' || s === 'magic_button';" }
             },
             "accessory": {
               "title": "Accessory name or AID",
               "type": "string",
-              "description": "Light sensor only — accessory to read from on the chosen bridge.",
-              "condition": { "functionBody": "return model.sensors && model.sensors[arrayIndices[0]] && model.sensors[arrayIndices[0]].service === 'light';" }
+              "description": "Accessory on the chosen bridge. For magic button, this is the target light to boost+restore.",
+              "condition": { "functionBody": "var s = model.sensors && model.sensors[arrayIndices[0]] && model.sensors[arrayIndices[0]].service; return s === 'light' || s === 'magic_button';" }
             },
             "characteristic": {
               "title": "Characteristic (e.g. CurrentAmbientLightLevel) or IID",
               "type": "string",
               "description": "Light sensor only — characteristic on the accessory to read.",
               "condition": { "functionBody": "return model.sensors && model.sensors[arrayIndices[0]] && model.sensors[arrayIndices[0]].service === 'light';" }
+            },
+            "targetBrightness": {
+              "title": "Target brightness when activated (0-100)",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 100,
+              "default": 100,
+              "description": "Magic button only — brightness to set when the switch is turned ON. Previous Brightness+On are snapshotted and restored on OFF.",
+              "condition": { "functionBody": "return model.sensors && model.sensors[arrayIndices[0]] && model.sensors[arrayIndices[0]].service === 'magic_button';" }
             },
             "holdSeconds": {
               "title": "Hold seconds on true→false",

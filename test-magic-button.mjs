@@ -1,0 +1,286 @@
+// Standalone tests for the MagicButton sensor.
+// Run with: node test-magic-button.mjs (after npm run build).
+
+import { MagicButton } from "./dist/sensors/magicButton.js";
+import { EventEmitter } from "node:events";
+
+// ──────────────────────────────────────────────────────────────────────────
+// Test scaffolding — minimal homebridge-shape fakes
+// ──────────────────────────────────────────────────────────────────────────
+
+class FakeCharacteristic { static UUID = "x"; }
+class FakeService {
+  static Switch = FakeService;
+  static AccessoryInformation = FakeService;
+  constructor() {
+    this.value = undefined;
+    this.onGetFn = undefined;
+    this.onSetFn = undefined;
+  }
+  setCharacteristic() { return this; }
+  getCharacteristic() {
+    const ch = {
+      onGet: (fn) => { this.onGetFn = fn; return ch; },
+      onSet: (fn) => { this.onSetFn = fn; return ch; },
+    };
+    return ch;
+  }
+  updateCharacteristic(_c, v) { this.value = v; }
+}
+const fakeAccessory = () => {
+  const svc = new FakeService();
+  return {
+    _svc: svc,
+    getService: () => svc,
+    addService: () => svc,
+  };
+};
+function makeLog() {
+  const events = [];
+  const push = (level) => (...args) => events.push({ level, args });
+  return Object.assign(events, {
+    info: push("info"),
+    debug: push("debug"),
+    warn: push("warn"),
+    error: push("error"),
+  });
+}
+const ch = { Name: FakeCharacteristic, Manufacturer: FakeCharacteristic, Model: FakeCharacteristic, SerialNumber: FakeCharacteristic, On: FakeCharacteristic };
+
+// A HapBridge stand-in. Records every write call; exposes a `push(char, value)`
+// helper to drive the subscribe listeners as if the underlying light reported
+// a new state.
+class FakeBridge extends EventEmitter {
+  constructor() {
+    super();
+    this.subscriptions = new Map(); // characteristic name -> listener
+    this.writes = []; // {char, value, ts}
+    this.writeShouldFail = false;
+  }
+  subscribe(matcher, listener) {
+    this.subscriptions.set(matcher.characteristic, listener);
+  }
+  async write(matcher, value) {
+    if (this.writeShouldFail) {
+      throw new Error("simulated write failure");
+    }
+    this.writes.push({ char: matcher.characteristic, value });
+  }
+  push(char, value) {
+    const l = this.subscriptions.get(char);
+    if (!l) throw new Error(`no subscriber for ${char}`);
+    l(value, false);
+  }
+  pushDegraded(char) {
+    const l = this.subscriptions.get(char);
+    if (!l) throw new Error(`no subscriber for ${char}`);
+    l(undefined, true);
+  }
+  clear() { this.writes.length = 0; }
+}
+
+function makePlatform() {
+  return {
+    log: makeLog(),
+    Service: FakeService,
+    Characteristic: ch,
+  };
+}
+
+let failed = 0;
+function assertEq(label, actual, expected) {
+  const a = JSON.stringify(actual);
+  const e = JSON.stringify(expected);
+  const pass = a === e;
+  if (!pass) failed++;
+  console.log(`${pass ? "PASS" : "FAIL"}  ${label}  actual=${a}  expected=${e}`);
+}
+
+function makeMagicButton(opts = {}) {
+  const platform = makePlatform();
+  const accessory = fakeAccessory();
+  const bridge = new FakeBridge();
+  const bridges = new Map([["loxone", bridge]]);
+  const config = {
+    name: "Kitchen Boost",
+    service: "magic_button",
+    bridge: "loxone",
+    accessory: "Kitchen Spotlight",
+    targetBrightness: opts.targetBrightness ?? 100,
+  };
+  const mb = new MagicButton(platform, accessory, config, bridges);
+  return { mb, bridge, accessory, platform };
+}
+
+function getOnHandler(accessory) {
+  // The MagicButton wires its onSet via getCharacteristic(...).onSet(fn).
+  // Our FakeService stores it on the service stash.
+  return accessory._svc.onSetFn;
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Test cases
+// ──────────────────────────────────────────────────────────────────────────
+
+async function testActivationSnapshotsAndWrites() {
+  const { mb, bridge, accessory } = makeMagicButton({ targetBrightness: 100 });
+  // Light reports current state: ON at 50%.
+  bridge.push("On", true);
+  bridge.push("Brightness", 50);
+  await getOnHandler(accessory)(true);
+  // Should have written On=true then Brightness=100, in that order.
+  assertEq(
+    "activate: writes On=true then Brightness=100",
+    bridge.writes,
+    [{ char: "On", value: true }, { char: "Brightness", value: 100 }],
+  );
+}
+
+async function testDeactivationRestoresSnapshot() {
+  const { mb, bridge, accessory } = makeMagicButton({ targetBrightness: 100 });
+  bridge.push("On", true);
+  bridge.push("Brightness", 50);
+  await getOnHandler(accessory)(true);
+  bridge.clear();
+  await getOnHandler(accessory)(false);
+  // Restore order: Brightness first, then On (per implementation comment).
+  assertEq(
+    "deactivate: restores Brightness=50 then On=true",
+    bridge.writes,
+    [{ char: "Brightness", value: 50 }, { char: "On", value: true }],
+  );
+}
+
+async function testCycleWhenTargetWasOff() {
+  // Light was OFF (brightness recorded as 30 from earlier) → magic ON → magic OFF
+  // should restore to OFF, not to 100%.
+  const { mb, bridge, accessory } = makeMagicButton({ targetBrightness: 100 });
+  bridge.push("On", false);
+  bridge.push("Brightness", 30);
+  await getOnHandler(accessory)(true);
+  bridge.clear();
+  await getOnHandler(accessory)(false);
+  assertEq(
+    "deactivate after target-was-off: restores Brightness=30 then On=false",
+    bridge.writes,
+    [{ char: "Brightness", value: 30 }, { char: "On", value: false }],
+  );
+}
+
+async function testMidCycleManualChangeIsOverridden() {
+  // Per user spec: manual change while ON gets overridden by restore.
+  const { mb, bridge, accessory } = makeMagicButton({ targetBrightness: 100 });
+  bridge.push("On", true);
+  bridge.push("Brightness", 50);
+  await getOnHandler(accessory)(true);
+  bridge.clear();
+  // User manually drags brightness to 75 while magic button is ON.
+  // The subscribe listener updates the cached target value — but the
+  // snapshot was already taken and should NOT be updated.
+  bridge.push("Brightness", 75);
+  await getOnHandler(accessory)(false);
+  assertEq(
+    "deactivate after mid-cycle manual change: restores original 50, not 75",
+    bridge.writes,
+    [{ char: "Brightness", value: 50 }, { char: "On", value: true }],
+  );
+}
+
+async function testShortCircuitNoChange() {
+  // Calling onSet(true) when already ON should be a no-op (no writes).
+  const { mb, bridge, accessory } = makeMagicButton({ targetBrightness: 100 });
+  bridge.push("On", true);
+  bridge.push("Brightness", 50);
+  await getOnHandler(accessory)(true);
+  bridge.clear();
+  await getOnHandler(accessory)(true); // redundant call
+  assertEq(
+    "redundant onSet(true) short-circuits",
+    bridge.writes,
+    [],
+  );
+}
+
+async function testNoSnapshotOnDeactivate() {
+  // Magic button starts OFF (no prior activation) → onSet(false) is a no-op.
+  // This simulates "Homebridge restarted while ON, then user toggles OFF".
+  const { mb, bridge, accessory } = makeMagicButton({ targetBrightness: 100 });
+  bridge.push("On", true);
+  bridge.push("Brightness", 50);
+  // Deactivate without prior activation — currentOn is already false, so
+  // handleOn(false) hits the short-circuit. To get the no-snapshot warning
+  // path, manipulate currentOn to true without going through activate.
+  // (Not strictly testable through the public API; we instead verify that
+  // the short-circuit fires and no writes happen.)
+  await getOnHandler(accessory)(false);
+  assertEq(
+    "onSet(false) while already off: no writes",
+    bridge.writes,
+    [],
+  );
+}
+
+async function testActivationRejectedWhenTargetUnknown() {
+  // Bridge hasn't reported any values yet → activation should reject and
+  // revert HomeKit switch state.
+  const { mb, bridge, accessory } = makeMagicButton({ targetBrightness: 100 });
+  await getOnHandler(accessory)(true);
+  assertEq(
+    "activation with no target state: no writes",
+    bridge.writes,
+    [],
+  );
+}
+
+async function testConfigValidatesTargetBrightnessRange() {
+  const platform = makePlatform();
+  const accessory = fakeAccessory();
+  const bridge = new FakeBridge();
+  const bridges = new Map([["loxone", bridge]]);
+  let threw = false;
+  try {
+    new MagicButton(platform, accessory, {
+      name: "Bad", service: "magic_button", bridge: "loxone",
+      accessory: "X", targetBrightness: 200,
+    }, bridges);
+  } catch (e) {
+    threw = /targetBrightness in \[0,100\]/.test(e.message);
+  }
+  assertEq("targetBrightness=200 rejected", threw, true);
+}
+
+async function testConfigValidatesBridgeExists() {
+  const platform = makePlatform();
+  const accessory = fakeAccessory();
+  const bridges = new Map();
+  let threw = false;
+  try {
+    new MagicButton(platform, accessory, {
+      name: "Orphan", service: "magic_button", bridge: "nonexistent",
+      accessory: "X", targetBrightness: 100,
+    }, bridges);
+  } catch (e) {
+    threw = /unknown bridge/.test(e.message);
+  }
+  assertEq("unknown bridge rejected", threw, true);
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+
+(async () => {
+  await testActivationSnapshotsAndWrites();
+  await testDeactivationRestoresSnapshot();
+  await testCycleWhenTargetWasOff();
+  await testMidCycleManualChangeIsOverridden();
+  await testShortCircuitNoChange();
+  await testNoSnapshotOnDeactivate();
+  await testActivationRejectedWhenTargetUnknown();
+  await testConfigValidatesTargetBrightnessRange();
+  await testConfigValidatesBridgeExists();
+
+  if (failed > 0) {
+    console.log(`\n${failed} test(s) FAILED`);
+    process.exit(1);
+  }
+  console.log("\nAll tests passed.");
+})();

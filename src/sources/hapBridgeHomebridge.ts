@@ -13,6 +13,7 @@ type Listener = (value: unknown, degraded: boolean) => void;
 
 const SHORT_NAMES: Record<string, string> = {
   On: "25",
+  Brightness: "8",
   MotionDetected: "22",
   OccupancyDetected: "71",
   ContactSensorState: "6A",
@@ -27,7 +28,10 @@ function matchesCharacteristicName(type: string, name: string | number): boolean
   if (!short) {
     return false;
   }
-  return type.toUpperCase() === short || type.toUpperCase().startsWith(`000000${short}-`);
+  // HAP UUIDs are 8 hex digits before the first dash — pad to that length so
+  // single-hex short names (e.g. Brightness=8 → 00000008-…) match correctly.
+  return type.toUpperCase() === short
+    || type.toUpperCase().startsWith(`${short.padStart(8, "0")}-`);
 }
 
 /**
@@ -129,6 +133,66 @@ export class HomebridgeHapBridge extends EventEmitter {
     if (this.discovered) {
       this.resolveAndBind({ matcher, listener });
     }
+  }
+
+  async write(matcher: CharacteristicMatcher, value: unknown): Promise<void> {
+    const client = this.client;
+    if (!client) {
+      throw new Error(`HAP bridge "${this.config.name}": not connected`);
+    }
+    if (!this.discovered) {
+      throw new Error(
+        `HAP bridge "${this.config.name}": services not yet discovered — write of "${matcher.characteristic}" on "${matcher.accessory}" rejected`,
+      );
+    }
+    const located = this.locate(matcher);
+    if (!located) {
+      throw new Error(
+        `HAP bridge "${this.config.name}": could not locate accessory "${matcher.accessory}" / characteristic "${matcher.characteristic}" for write`,
+      );
+    }
+    const { service, iid } = located;
+    // The `@oznu/hap-client` setCharacteristic API expects its richer
+    // `ServiceType` shape; at runtime the `service` we hold IS that shape
+    // (we cast down on read in `getAllServices()`), so the unknown cast is
+    // safe. The value type is narrowed by hap-client at the network boundary.
+    await client.setCharacteristic(
+      service as unknown as Parameters<typeof client.setCharacteristic>[0],
+      iid,
+      value as number | string | boolean,
+    );
+  }
+
+  /**
+   * Resolve a (accessory, characteristic) matcher against the current service
+   * snapshot. Returns the owning service + characteristic iid, or undefined if
+   * either side can't be found. Used by both subscribe() (read) and write().
+   */
+  private locate(
+    matcher: CharacteristicMatcher,
+  ): { service: HapService; iid: number } | undefined {
+    const accIdent = matcher.accessory;
+    const chIdent = matcher.characteristic;
+    const matches = this.services.filter((svc) => {
+      if (typeof accIdent === "number") {
+        return svc.aid === accIdent;
+      }
+      return svc.serviceName === accIdent || svc.instance?.name === accIdent;
+    });
+    for (const svc of matches) {
+      for (const ch of svc.serviceCharacteristics) {
+        const isMatch =
+          typeof chIdent === "number"
+            ? ch.iid === chIdent
+            : ch.description === chIdent
+              || ch.type === chIdent
+              || matchesCharacteristicName(ch.type, chIdent);
+        if (isMatch) {
+          return { service: svc, iid: ch.iid };
+        }
+      }
+    }
+    return undefined;
   }
 
   private async bootstrap(): Promise<void> {
@@ -241,16 +305,21 @@ export class HomebridgeHapBridge extends EventEmitter {
         `no accessories returned from ${this.config.host}:${this.config.port} (likely ECONNREFUSED / bridge not yet ready)`,
       );
     }
-    this.onServices(all);
+    this.handleFullSnapshot(all);
     if (!this.monitor) {
       this.monitor = await client.monitorCharacteristics();
       this.monitor.on("service-update", (updated: unknown) => {
-        this.onServices(updated as HapService[]);
+        this.handleServiceUpdate(updated as HapService[]);
       });
     }
   }
 
-  private onServices(services: HapService[]): void {
+  /**
+   * Full topology refresh from {@link HapClient.getAllServices}. Replaces
+   * `this.services` with the complete filtered list — this is the only
+   * code path that should overwrite our service catalog.
+   */
+  private handleFullSnapshot(services: HapService[]): void {
     const filtered = services.filter((svc) => svc.instance?.port === this.config.port);
     this.services = filtered;
     this.discovered = true;
@@ -266,6 +335,28 @@ export class HomebridgeHapBridge extends EventEmitter {
       this.resolveAndBind(p);
     }
 
+    for (const svc of filtered) {
+      for (const ch of svc.serviceCharacteristics) {
+        this.dispatch(svc.aid, ch.iid, ch.value, false);
+      }
+    }
+  }
+
+  /**
+   * Handle a partial `service-update` event from {@link HapMonitor}. Per
+   * `@oznu/hap-client@1.x` (see `monitor.js`), the emitted array contains
+   * ONLY the services whose characteristics changed in this batch — it is a
+   * value-change notification, not a topology refresh. Replacing
+   * `this.services` with this subset shrinks the catalog to 1-2 entries
+   * and breaks write-path resolution against any aid that hadn't just
+   * changed. (Read subscribers were unaffected because dispatch is keyed by
+   * (aid, iid) in the `resolved` map — they get values directly from this
+   * call without needing `this.services`.) Just dispatch the new values;
+   * the next watchdog refresh repopulates the full catalog from
+   * `getAllServices`.
+   */
+  private handleServiceUpdate(updated: HapService[]): void {
+    const filtered = updated.filter((svc) => svc.instance?.port === this.config.port);
     for (const svc of filtered) {
       for (const ch of svc.serviceCharacteristics) {
         this.dispatch(svc.aid, ch.iid, ch.value, false);
