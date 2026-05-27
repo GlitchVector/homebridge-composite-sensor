@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import {
   API,
   Characteristic,
@@ -79,22 +80,93 @@ export class CompositeSensorPlatform implements DynamicPlatformPlugin {
     this.accessories.push(accessory);
   }
 
+  /**
+   * Re-read our platform entry from `config.json` on disk and return it.
+   *
+   * When this plugin is run as a child bridge (the typical setup), homebridge
+   * passes the parent supervisor's in-memory config snapshot to each child at
+   * fork time. The parent only refreshes that snapshot on its own restart, so
+   * an out-of-band edit to `config.json` (anything that doesn't go through
+   * Homebridge UI X — manual edits, scripts, MAC-allowlist-style automation)
+   * is invisible to the child bridge across a child-only restart.
+   *
+   * To make "edit config + bounce child bridge" Just Work for this plugin,
+   * read the live file off disk and use that as the source of truth. Fall
+   * back to `this.config` if anything goes wrong (missing file path, parse
+   * error, no matching entry) — silent fallback would mask configuration
+   * drift, so log on every fallback path with enough context to diagnose.
+   *
+   * Multi-instance safety: a user can run several `CompositeSensor` platform
+   * entries side-by-side (each with its own child bridge). They're
+   * disambiguated by `_bridge.username`, which homebridge injects into the
+   * config passed to each child. Match on that before trusting the entry.
+   */
+  private resolveLiveConfig(): CompositeSensorPlatformConfig {
+    type WithBridge = CompositeSensorPlatformConfig & {
+      _bridge?: { username?: string };
+    };
+    const myBridgeUsername = (this.config as WithBridge)._bridge?.username;
+    let configPath: string;
+    try {
+      configPath = this.api.user.configPath();
+    } catch (err) {
+      this.log.warn(
+        `Could not resolve config.json path (${(err as Error).message}); ` +
+          `using in-memory config passed by homebridge.`,
+      );
+      return this.config;
+    }
+    let file: { platforms?: WithBridge[] };
+    try {
+      file = JSON.parse(readFileSync(configPath, "utf8"));
+    } catch (err) {
+      this.log.warn(
+        `Could not re-read ${configPath} (${(err as Error).message}); ` +
+          `using in-memory config passed by homebridge.`,
+      );
+      return this.config;
+    }
+    const candidates = (file.platforms ?? []).filter(
+      (p) => p.platform === PLATFORM_NAME,
+    );
+    if (candidates.length === 0) {
+      this.log.warn(
+        `No ${PLATFORM_NAME} entry found in ${configPath}; ` +
+          `using in-memory config passed by homebridge.`,
+      );
+      return this.config;
+    }
+    const match = myBridgeUsername
+      ? candidates.find((p) => p._bridge?.username === myBridgeUsername)
+      : candidates[0];
+    if (!match) {
+      this.log.warn(
+        `Found ${candidates.length} ${PLATFORM_NAME} entries in ${configPath} ` +
+          `but none match my child-bridge username ${myBridgeUsername}; ` +
+          `using in-memory config passed by homebridge.`,
+      );
+      return this.config;
+    }
+    return match;
+  }
+
   private bootstrap(): void {
-    const sourceConfigs = this.config.sources ?? [];
-    const sensorConfigs = this.config.sensors ?? [];
+    const liveConfig = this.resolveLiveConfig();
+    const sourceConfigs = liveConfig.sources ?? [];
+    const sensorConfigs = liveConfig.sensors ?? [];
 
     // --- MQTT broker (lazy: only constructed if any MQTT source is declared) ---
     const hasMqttSource = sourceConfigs.some((s) => s.type === "mqtt");
     if (hasMqttSource) {
-      if (!this.config.mqtt?.url) {
+      if (!liveConfig.mqtt?.url) {
         this.log.error("MQTT sources declared but no `mqtt.url` in config — MQTT sources will be skipped");
       } else {
-        this.mqttBroker = new MqttBroker(this.config.mqtt, this.log);
+        this.mqttBroker = new MqttBroker(liveConfig.mqtt, this.log);
       }
     }
 
     // --- HAP bridges ---
-    for (const bridgeConfig of this.config.hapBridges ?? []) {
+    for (const bridgeConfig of liveConfig.hapBridges ?? []) {
       if (!bridgeConfig.name || !bridgeConfig.host || !bridgeConfig.port || !bridgeConfig.pin) {
         this.log.error(
           `hapBridges entry missing required fields (name/host/port/pin): ${JSON.stringify(bridgeConfig)}`,
