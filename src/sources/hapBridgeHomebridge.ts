@@ -38,6 +38,31 @@ function matchesCharacteristicName(type: string, name: string | number): boolean
 }
 
 /**
+ * Reject if `p` doesn't settle within `ms`. Wraps `@oznu/hap-client` network
+ * calls so a half-open TCP socket (the silent-death failure mode) surfaces as
+ * an error the watchdog can act on, instead of an `await` that never returns.
+ */
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`${label} timed out after ${ms}ms`)),
+      ms,
+    );
+    timer.unref?.();
+    p.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
+
+/**
  * `@oznu/hap-client`-based bridge for other Homebridge instances / child
  * bridges. Uses the Homebridge-specific `Authorization: <pin>` HTTP header
  * shortcut — works against Homebridge HAP servers (which expose an
@@ -72,15 +97,33 @@ export class HomebridgeHapBridge extends EventEmitter {
   /**
    * Watchdog state. `@oznu/hap-client` SSE event streams can die silently
    * (no disconnect event surfaces) — observed in the wild as a `mode:
-   * "homebridge"` bridge going totally quiet for 22h while polling-based
-   * HTTP reads still worked. The watchdog runs `refreshAccessories()` on a
-   * timer to dispatch current values (catches persistent drift) and forces
-   * a monitor rebuild every Nth poll (catches dead SSE streams).
+   * "homebridge"` bridge going totally quiet for ~24h while polling-based
+   * HTTP reads still worked. Tearing down and recreating the SSE *monitor*
+   * alone proved insufficient (the underlying client connection pool stays
+   * wedged), so the watchdog escalates to a full client rebuild — a fresh
+   * `HapClient` + reconnect, the in-process equivalent of restarting the
+   * container, which is what historically cleared these hangs.
+   *
+   * Three escalation triggers, all routed to {@link rebuildClient}:
+   *  - `consecutiveFailures` HTTP refreshes in a row (stale port after a
+   *    child-bridge restart, ECONNREFUSED, or a hung socket caught by the
+   *    I/O timeout).
+   *  - No SSE `service-update` for `SSE_STALE_REBUILD_MS` (the silent-death
+   *    mode). A genuinely idle bridge reconnects harmlessly on this cadence;
+   *    a silently-dead one is resurrected. Widen the window if the target
+   *    bridge is legitimately quiet for long stretches and the reconnect
+   *    churn matters.
+   *  - A failed/timed-out write (magic buttons are write-only, so the
+   *    read-path checks above would never notice their transport is dead).
    */
   private watchdogTimer?: NodeJS.Timeout;
-  private pollCount = 0;
+  private consecutiveFailures = 0;
+  private lastSseEventAt = 0;
+  private rebuildInFlight = false;
   private static readonly WATCHDOG_INTERVAL_MS = 60_000;
-  private static readonly RESET_EVERY_N_POLLS = 5;
+  private static readonly FAIL_ESCALATE_THRESHOLD = 3;
+  private static readonly SSE_STALE_REBUILD_MS = 15 * 60_000;
+  private static readonly IO_TIMEOUT_MS = 20_000;
 
   constructor(
     public readonly config: HapBridgeConfig,
@@ -96,13 +139,19 @@ export class HomebridgeHapBridge extends EventEmitter {
     this.log.info(
       `HAP bridge "${this.config.name}" (homebridge) connecting directly to ${this.config.host}:${this.config.port}`,
     );
+    this.lastSseEventAt = Date.now();
+    this.client = this.createClient();
 
+    void this.bootstrap();
+  }
+
+  private createClient(): HapClient {
     // hap-client's debug() method calls `logger.log` — not `logger.debug` —
     // so the adapter must expose `log`. It silently crashes the async
     // discovery callback otherwise (only visible in stderr as a
     // TypeError stack trace).
     const logFn = (...a: unknown[]) => this.log.debug(`[hap:${this.config.name}]`, ...a);
-    const client = new HapClient({
+    return new HapClient({
       pin: this.config.pin,
       logger: {
         log: logFn,
@@ -113,9 +162,6 @@ export class HomebridgeHapBridge extends EventEmitter {
       },
       config: { debug: false },
     });
-    this.client = client;
-
-    void this.bootstrap();
   }
 
   stop(): void {
@@ -159,11 +205,28 @@ export class HomebridgeHapBridge extends EventEmitter {
     // `ServiceType` shape; at runtime the `service` we hold IS that shape
     // (we cast down on read in `getAllServices()`), so the unknown cast is
     // safe. The value type is narrowed by hap-client at the network boundary.
-    await client.setCharacteristic(
-      service as unknown as Parameters<typeof client.setCharacteristic>[0],
-      iid,
-      value as number | string | boolean,
-    );
+    try {
+      await withTimeout(
+        client.setCharacteristic(
+          service as unknown as Parameters<typeof client.setCharacteristic>[0],
+          iid,
+          value as number | string | boolean,
+        ),
+        HomebridgeHapBridge.IO_TIMEOUT_MS,
+        `HAP bridge "${this.config.name}" write of "${matcher.characteristic}" on "${matcher.accessory}"`,
+      );
+    } catch (err) {
+      // A failed/timed-out write is the clearest signal this connection is
+      // wedged — and magic buttons are write-only, so the read-path watchdog
+      // would never notice on its own. Kick a rebuild so the next press
+      // lands, then surface the failure to the caller.
+      this.log.warn(
+        `HAP bridge "${this.config.name}" write failed, scheduling reconnect:`,
+        (err as Error).message,
+      );
+      void this.rebuildClient("write failure");
+      throw err;
+    }
   }
 
   /**
@@ -237,46 +300,95 @@ export class HomebridgeHapBridge extends EventEmitter {
   }
 
   /**
-   * Watchdog cycle. Every WATCHDOG_INTERVAL_MS:
-   *  - Refresh accessories via HTTP (independent of SSE health). The
-   *    `onServices()` dispatch will surface any drift to listeners, since
-   *    `Source.update()` only emits "change" on actual transitions.
-   *  - Every Nth cycle, also tear down the SSE monitor first so
-   *    `refreshAccessories()` recreates it. Defense against silent
-   *    `@oznu/hap-client` event-stream death.
+   * Watchdog cycle, every WATCHDOG_INTERVAL_MS. Refresh accessories via HTTP
+   * (independent of SSE health) — the dispatch surfaces any value drift to
+   * listeners, since `Source.update()` only emits "change" on actual
+   * transitions. Two failure modes escalate to a full {@link rebuildClient}:
+   * repeated HTTP refresh failures, and an SSE stream that's gone silent past
+   * `SSE_STALE_REBUILD_MS` (`lastSseEventAt` only advances on real
+   * `service-update` events or a reconnect, never on a plain refresh).
    *
-   * Transient toggles (e.g. door open→close within one interval) can still
-   * be missed if SSE is dead and both edges fall between polls — this
-   * watchdog bounds the silence window, not the per-event guarantee.
+   * Transient toggles can still be missed if SSE is dead and both edges fall
+   * between polls — this watchdog bounds the silence window, not the
+   * per-event guarantee.
    */
   private async runWatchdog(): Promise<void> {
-    if (this.stopped || !this.client) {
+    if (this.stopped || !this.client || this.rebuildInFlight) {
       return;
     }
-    this.pollCount++;
-    const forceMonitorReset =
-      this.pollCount % HomebridgeHapBridge.RESET_EVERY_N_POLLS === 0;
-    if (forceMonitorReset) {
-      this.log.debug(
-        `HAP bridge "${this.config.name}" watchdog: scheduled monitor reset (poll #${this.pollCount})`,
+
+    try {
+      await this.refreshAccessories();
+      this.consecutiveFailures = 0;
+    } catch (err) {
+      this.consecutiveFailures++;
+      this.log.warn(
+        `HAP bridge "${this.config.name}" watchdog refresh failed `
+          + `(${this.consecutiveFailures}/${HomebridgeHapBridge.FAIL_ESCALATE_THRESHOLD}):`,
+        (err as Error).message,
       );
+      if (this.consecutiveFailures >= HomebridgeHapBridge.FAIL_ESCALATE_THRESHOLD) {
+        this.consecutiveFailures = 0;
+        await this.rebuildClient("repeated refresh failures");
+      }
+      return;
+    }
+
+    // Second line of defense: HTTP reads succeed but the SSE stream has gone
+    // silent (the documented silent-death mode). A monitor reset alone has
+    // proven insufficient, so escalate to a full client rebuild.
+    const sseSilentMs = Date.now() - this.lastSseEventAt;
+    if (sseSilentMs >= HomebridgeHapBridge.SSE_STALE_REBUILD_MS) {
+      await this.rebuildClient(`no SSE events for ${Math.round(sseSilentMs / 1000)}s`);
+    }
+  }
+
+  /**
+   * Full reconnect: drop the SSE monitor and the entire `HapClient`, build a
+   * fresh one, and re-discover. This is the in-process equivalent of a
+   * container restart — the only thing observed to reliably clear a silently
+   * wedged `@oznu/hap-client` connection. Guarded so overlapping triggers (a
+   * failure escalation racing the staleness check, or a write failure firing
+   * mid-cycle) don't stack.
+   */
+  private async rebuildClient(reason: string): Promise<void> {
+    if (this.stopped || this.rebuildInFlight) {
+      return;
+    }
+    this.rebuildInFlight = true;
+    this.log.warn(`HAP bridge "${this.config.name}" rebuilding connection (${reason})`);
+    try {
       try {
         this.monitor?.finish();
       } catch (err) {
         this.log.debug(
-          `HAP bridge "${this.config.name}" monitor.finish() during watchdog reset threw:`,
+          `HAP bridge "${this.config.name}" monitor.finish() during rebuild threw:`,
           (err as Error).message,
         );
       }
       this.monitor = undefined;
-    }
-    try {
+      try {
+        this.client?.resetInstancePool();
+      } catch (err) {
+        this.log.debug(
+          `HAP bridge "${this.config.name}" resetInstancePool() during rebuild threw:`,
+          (err as Error).message,
+        );
+      }
+      this.client = this.createClient();
+      this.reseedInstance();
       await this.refreshAccessories();
+      this.consecutiveFailures = 0;
+      this.lastSseEventAt = Date.now();
+      this.log.info(`HAP bridge "${this.config.name}" reconnected after rebuild`);
     } catch (err) {
       this.log.warn(
-        `HAP bridge "${this.config.name}" watchdog refresh failed:`,
+        `HAP bridge "${this.config.name}" rebuild failed, will retry next watchdog cycle:`,
         (err as Error).message,
       );
+      this.markAllDegraded();
+    } finally {
+      this.rebuildInFlight = false;
     }
   }
 
@@ -301,7 +413,11 @@ export class HomebridgeHapBridge extends EventEmitter {
     if (!client) {
       return;
     }
-    const all = (await client.getAllServices()) as unknown as HapService[];
+    const all = (await withTimeout(
+      client.getAllServices(),
+      HomebridgeHapBridge.IO_TIMEOUT_MS,
+      `HAP bridge "${this.config.name}" getAllServices`,
+    )) as unknown as HapService[];
     const matching = all.filter((svc) => svc.instance?.port === this.config.port);
     if (matching.length === 0) {
       throw new Error(
@@ -310,10 +426,19 @@ export class HomebridgeHapBridge extends EventEmitter {
     }
     this.handleFullSnapshot(all);
     if (!this.monitor) {
-      this.monitor = await client.monitorCharacteristics();
+      this.monitor = await withTimeout(
+        client.monitorCharacteristics(),
+        HomebridgeHapBridge.IO_TIMEOUT_MS,
+        `HAP bridge "${this.config.name}" monitorCharacteristics`,
+      );
       this.monitor.on("service-update", (updated: unknown) => {
+        this.lastSseEventAt = Date.now();
         this.handleServiceUpdate(updated as HapService[]);
       });
+      // A freshly-established monitor counts as liveness — otherwise a bridge
+      // that's quiet right after (re)connect could trip the staleness rebuild
+      // before its first real event arrives.
+      this.lastSseEventAt = Date.now();
     }
   }
 
