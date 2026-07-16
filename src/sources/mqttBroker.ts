@@ -35,7 +35,9 @@ export class MqttBroker {
   ) {}
 
   start(): void {
-    if (this.client || this.stopped) {
+    // A pending reconnect means a chain is already live even though there is
+    // no client yet; starting again would run two in parallel.
+    if (this.client || this.reconnectTimer || this.stopped) {
       return;
     }
     this.connect();
@@ -70,6 +72,7 @@ export class MqttBroker {
   }
 
   private connect(): void {
+    this.reconnectTimer = undefined;
     if (this.stopped) {
       return;
     }
@@ -111,13 +114,29 @@ export class MqttBroker {
       }
     });
 
+    // A single failure emits BOTH "error" and "close", and a client we have
+    // already given up on can still emit after we moved on. Either would
+    // schedule a second reconnect chain, and every chain spawns a client that
+    // fans out the same way — the loop doubles each cycle until the log flood
+    // fills the log tmpfs and takes homebridge down with it. Handle the first
+    // event per client only, and ignore any client that is no longer current.
+    let disconnected = false;
     const onDisconnect = (reason: string) => {
+      if (disconnected || client !== this.client) {
+        return;
+      }
+      disconnected = true;
       if (this.stopped) {
         return;
       }
       this.setConnected(false);
-      this.client?.end(true);
+      // Listeners stay attached: an "error" with no listener is an uncaught
+      // exception, and end(true) can still emit.
+      client.end(true);
       this.client = undefined;
+      if (this.reconnectTimer) {
+        clearTimeout(this.reconnectTimer);
+      }
       const delay = backoffMs(this.reconnectAttempt++);
       this.log.warn(`MQTT ${reason}; reconnecting in ${Math.round(delay / 1000)}s`);
       this.reconnectTimer = setTimeout(() => this.connect(), delay);
