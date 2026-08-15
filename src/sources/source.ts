@@ -22,6 +22,17 @@ export abstract class Source extends EventEmitter {
    * only release on a recent exit-trigger edge.
    */
   public lastFallingEdgeAt: number | undefined;
+  /**
+   * Monotonic `Date.now()` when this source last transitioned false→true
+   * (a "rising edge"). Undefined until the source has had such a
+   * transition. Consumed by the door-anchor confirmation re-check as its
+   * "did anything actually happen in the flat" signal.
+   *
+   * Deliberately NOT set on the undefined→true first emit: that is the
+   * source coming up after subscribe(), not somebody appearing. Same
+   * reasoning as the door source's startup-emit guard in compositeSensor.
+   */
+  public lastRisingEdgeAt: number | undefined;
 
   constructor(
     public readonly name: string,
@@ -38,6 +49,9 @@ export abstract class Source extends EventEmitter {
     const changed = prev !== next || this.degraded !== degraded;
     if (prev === true && next === false) {
       this.lastFallingEdgeAt = Date.now();
+    }
+    if (prev === false && next === true) {
+      this.lastRisingEdgeAt = Date.now();
     }
     this.value = next;
     this.degraded = degraded;

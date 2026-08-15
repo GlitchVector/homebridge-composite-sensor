@@ -20,6 +20,17 @@ interface PersistedSensorState {
    * door-event and check-firing silently drops the scheduled flip.
    */
   pendingDoorCheckAt?: string;
+  /**
+   * ISO 8601 deadline for a door-anchor confirmation re-check, and the
+   * instant the `home` it is re-checking was published. Both non-undefined
+   * only when `mode === "door-anchor"`, `confirmAfterMinutes > 0`, and a
+   * door check has published `home` whose confirmation hasn't fired yet.
+   * Persisted together because the re-check needs the publish instant to
+   * ask "any rising edge SINCE then" — a restart that kept the deadline
+   * but lost the origin would compare against the wrong window.
+   */
+  pendingConfirmAt?: string;
+  homePublishedAt?: string;
 }
 
 type CharacteristicCtor = WithUUID<new () => Characteristic>;
@@ -131,6 +142,37 @@ export interface CompositeSensorConfig {
    * for FP2 firmware staleness.
    */
   stableForSeconds?: number;
+  /**
+   * Default 0 (disabled). Only meaningful when mode === "door-anchor".
+   *
+   * Confirmation re-check. `stableForSeconds` only filters presence spikes
+   * SHORTER than itself, so a zone that sticks true for its full firmware
+   * timeout sails through and latches `home` — and because door-anchor is
+   * sticky by construction, that wrong `home` then survives until the next
+   * door crossing. Observed 2026-08-14: an FP2 office zone rose 9min after
+   * the occupant left, held for exactly 60min (its zone timeout), was the
+   * only thing lit when the +20min check sampled, and left "Somebody Home"
+   * true for 16h in an empty flat.
+   *
+   * When > 0, publishing `home` from a door check also schedules a single
+   * re-check this many minutes later. That re-check flips to away ONLY if
+   * BOTH hold: the expression is false now, AND no referenced source has
+   * had a rising edge since the `home` was published. A real occupant
+   * fails both tests — they either register somewhere or they moved at
+   * some point — while a lone stuck zone that has since timed out fails
+   * neither. A new door event supersedes and cancels it.
+   *
+   * Set well past the longest stuck-zone timeout you see (FP2 zones are
+   * ~60min, so 90 is a sensible floor).
+   *
+   * KNOWN TRADE-OFF: an occupant who is already motionless when the
+   * re-check fires, and who moved only BEFORE the `home` was published,
+   * reads identical to an empty flat and gets flipped to away. The
+   * realistic case is one occupant leaving late at night while the other
+   * is already in bed. Widen `confirmAfterMinutes` to push the re-check
+   * past that window, or leave at 0 to keep the old sticky behavior.
+   */
+  confirmAfterMinutes?: number;
   /** Required when mode === "set-reset". Boolean expression whose rising edge sets state=true. */
   setOn?: string;
   /** Required when mode === "set-reset". Boolean expression whose rising edge sets state=false. */
@@ -183,6 +225,20 @@ export class CompositeSensor extends EventEmitter {
   private pendingDoorCheckTimer?: NodeJS.Timeout;
   /** Epoch ms when the pending door-anchor check should fire. Persisted. */
   private pendingDoorCheckAt?: number;
+  /** Confirmation re-check window for door-anchor `home`. Milliseconds. 0 = disabled. */
+  private readonly confirmAfterMs: number;
+  /**
+   * When this sensor object was constructed. `Source.lastRisingEdgeAt` lives
+   * only in memory, so for any window starting before this instant we have no
+   * rising-edge record — absence of edges is then "we didn't observe", not
+   * "nothing happened", and the confirmation re-check must not revoke on it.
+   */
+  private readonly startedAt = Date.now();
+  private pendingConfirmTimer?: NodeJS.Timeout;
+  /** Epoch ms when the pending confirmation re-check should fire. Persisted. */
+  private pendingConfirmAt?: number;
+  /** Epoch ms when the `home` being re-checked was published. Persisted. */
+  private homePublishedAt?: number;
   /** Separate listener for door source so we can detach independently. */
   private readonly doorChangeListener?: () => void;
 
@@ -221,6 +277,7 @@ export class CompositeSensor extends EventEmitter {
     this.checkAfterMs = Math.max(0, (config.checkAfterMinutes ?? 5) * 60_000);
     this.autoCorrectOnPresence = config.autoCorrectOnPresence ?? true;
     this.stableForMs = Math.max(0, (config.stableForSeconds ?? 0) * 1000);
+    this.confirmAfterMs = Math.max(0, (config.confirmAfterMinutes ?? 0) * 60_000);
 
     if (this.mode === "set-reset") {
       if (!config.setOn || !config.resetOn) {
@@ -383,6 +440,21 @@ export class CompositeSensor extends EventEmitter {
       }
     }
 
+    // Same for a pending confirmation re-check. runConfirmCheck() refuses to
+    // revoke when the rising-edge history it needs predates this process
+    // (see startedAt), so a restart inside the window degrades to "leave the
+    // state alone" rather than to a blind flip.
+    if (
+      this.mode === "door-anchor"
+      && this.confirmAfterMs > 0
+      && this.pendingConfirmAt !== undefined
+    ) {
+      this.armConfirmTimer(this.pendingConfirmAt - Date.now());
+    } else if (this.pendingConfirmAt !== undefined) {
+      this.cancelConfirmCheck("mode/config no longer has confirmation enabled");
+      this.persistState();
+    }
+
     this.recompute();
   }
 
@@ -458,6 +530,16 @@ export class CompositeSensor extends EventEmitter {
         this.pendingDoorCheckAt = t;
       }
     }
+    // Both halves or neither — the deadline is meaningless without the
+    // instant it measures rising edges from.
+    if (typeof data.pendingConfirmAt === "string" && typeof data.homePublishedAt === "string") {
+      const deadline = Date.parse(data.pendingConfirmAt);
+      const origin = Date.parse(data.homePublishedAt);
+      if (!Number.isNaN(deadline) && !Number.isNaN(origin)) {
+        this.pendingConfirmAt = deadline;
+        this.homePublishedAt = origin;
+      }
+    }
     // Seed HAP cache so HomeKit's initial read returns the right value.
     // updateCharacteristic on a service whose accessory hasn't been
     // announced yet just sets the cached value — no notifications fire.
@@ -490,6 +572,12 @@ export class CompositeSensor extends EventEmitter {
       savedAt: new Date().toISOString(),
       ...(this.pendingDoorCheckAt !== undefined
         ? { pendingDoorCheckAt: new Date(this.pendingDoorCheckAt).toISOString() }
+        : {}),
+      ...(this.pendingConfirmAt !== undefined && this.homePublishedAt !== undefined
+        ? {
+          pendingConfirmAt: new Date(this.pendingConfirmAt).toISOString(),
+          homePublishedAt: new Date(this.homePublishedAt).toISOString(),
+        }
         : {}),
     };
     try {
@@ -549,6 +637,10 @@ export class CompositeSensor extends EventEmitter {
     if (this.pendingDoorCheckTimer) {
       clearTimeout(this.pendingDoorCheckTimer);
       this.pendingDoorCheckTimer = undefined;
+    }
+    if (this.pendingConfirmTimer) {
+      clearTimeout(this.pendingConfirmTimer);
+      this.pendingConfirmTimer = undefined;
     }
   }
 
@@ -720,6 +812,9 @@ export class CompositeSensor extends EventEmitter {
       this.sustainedCheckCancel.cancelled = true;
       this.sustainedCheckCancel = undefined;
     }
+    // A door crossing is fresher evidence than any outstanding confirmation
+    // re-check, and the +N check scheduled below supersedes it outright.
+    this.cancelConfirmCheck("new door event");
     if (!this.currentValue) {
       this.platform.log.info(
         `Sensor "${this.config.name}" door event while away — instant flip to home (rule 5)`,
@@ -764,7 +859,11 @@ export class CompositeSensor extends EventEmitter {
     // — false is always trustworthy in this design, only true is at risk
     // of being a transient FP2 false-positive).
     if (this.stableForMs === 0 || !evaluated) {
-      this.setValue(evaluated);
+      if (evaluated) {
+        this.publishDoorAnchorHome();
+      } else {
+        this.setValue(false);
+      }
       return;
     }
     // Sustained-true validation: defer publishing true; re-sample every
@@ -809,7 +908,108 @@ export class CompositeSensor extends EventEmitter {
     if (this.sustainedCheckCancel === cancel) {
       this.sustainedCheckCancel = undefined;
     }
+    this.publishDoorAnchorHome();
+  }
+
+  /**
+   * Single exit point for "a door check concluded `home`". Publishes true and
+   * arms the confirmation re-check, so both the snapshot path and the
+   * sustained-true path get the same follow-up. See `confirmAfterMinutes`.
+   */
+  private publishDoorAnchorHome(): void {
     this.setValue(true);
+    if (this.confirmAfterMs === 0) {
+      return;
+    }
+    this.homePublishedAt = Date.now();
+    this.pendingConfirmAt = this.homePublishedAt + this.confirmAfterMs;
+    this.persistState();
+    this.platform.log.info(
+      `Sensor "${this.config.name}" confirmation re-check scheduled in ${this.confirmAfterMs / 60_000}min`,
+    );
+    this.armConfirmTimer(this.confirmAfterMs);
+  }
+
+  private armConfirmTimer(delayMs: number): void {
+    if (this.pendingConfirmTimer) {
+      clearTimeout(this.pendingConfirmTimer);
+    }
+    this.pendingConfirmTimer = setTimeout(() => {
+      this.pendingConfirmTimer = undefined;
+      this.runConfirmCheck();
+    }, Math.max(0, delayMs));
+  }
+
+  private cancelConfirmCheck(reason: string): void {
+    if (this.pendingConfirmTimer) {
+      clearTimeout(this.pendingConfirmTimer);
+      this.pendingConfirmTimer = undefined;
+    }
+    if (this.pendingConfirmAt !== undefined) {
+      this.platform.log.debug(
+        `Sensor "${this.config.name}" confirmation re-check cancelled (${reason})`,
+      );
+    }
+    this.pendingConfirmAt = undefined;
+    this.homePublishedAt = undefined;
+  }
+
+  /**
+   * Confirmation re-check: was the `home` we published `confirmAfterMinutes`
+   * ago real? Flip to away only on BOTH tests failing to find an occupant —
+   * expression false now, and no rising edge on any referenced source since
+   * the publish. A stuck zone that has since timed out leaves exactly that
+   * signature; a real occupant trips one or the other.
+   *
+   * Never flips to `home` — that would be rule 4 (auto-correct on presence)
+   * by the back door, and a phantom is a false yes to it. This check can
+   * only ever revoke a `home` it issued itself.
+   */
+  private runConfirmCheck(): void {
+    const since = this.homePublishedAt;
+    this.pendingConfirmAt = undefined;
+    this.homePublishedAt = undefined;
+    if (this.mode !== "door-anchor" || since === undefined) {
+      return;
+    }
+    if (!this.currentValue) {
+      // Something already took us to away (a later door check). Nothing to revoke.
+      this.persistState();
+      return;
+    }
+    if (this.evaluateOnce()) {
+      this.platform.log.info(
+        `Sensor "${this.config.name}" confirmation re-check — expression still true, staying home`,
+      );
+      this.persistState();
+      return;
+    }
+    if (this.startedAt > since) {
+      this.platform.log.info(
+        `Sensor "${this.config.name}" confirmation re-check — homebridge restarted inside the `
+          + "window, rising-edge history for it is gone; staying home rather than guessing",
+      );
+      this.persistState();
+      return;
+    }
+    const movers = this.referencedSources.filter((name) => {
+      const at = this.sources.get(name)?.lastRisingEdgeAt;
+      return at !== undefined && at > since;
+    });
+    if (movers.length > 0) {
+      this.platform.log.info(
+        `Sensor "${this.config.name}" confirmation re-check — expression false but `
+          + `${movers.length} source(s) fired since (${movers.join(", ")}), staying home`,
+      );
+      this.persistState();
+      return;
+    }
+    this.platform.log.warn(
+      `Sensor "${this.config.name}" confirmation re-check — expression false and no source `
+        + `rising edge in the ${this.confirmAfterMs / 60_000}min since publishing home; `
+        + "revoking (stuck-zone false positive)",
+    );
+    this.setValue(false);
   }
 
   private applyDegradedPolicy(): boolean {
