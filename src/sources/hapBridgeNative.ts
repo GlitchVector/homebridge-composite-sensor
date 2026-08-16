@@ -139,6 +139,36 @@ export class NativeHapBridge extends EventEmitter {
   private lastConfigNumber?: number;
   private reconcileInFlight = false;
 
+  /**
+   * Watchdog state. `hap-controller` raises `event-disconnect` when it NOTICES
+   * the event connection drop, and that path already reconnects. What it does
+   * not cover is a *silently* dead connection: the TCP socket stays
+   * ESTABLISHED, no events ever arrive, and nothing in the library complains.
+   * The bridge then looks perfectly healthy while reporting frozen values.
+   *
+   * Observed 2026-08-14 on three Aqara FP2s: every zone stuck at its last
+   * value, sockets ESTABLISHED to all three accessories, zero `event-disconnect`
+   * — while the `mode: "homebridge"` bridges on the same instance visibly
+   * self-healed every ~16 min because THEY had a watchdog and this class did
+   * not.
+   *
+   * Detection deliberately does NOT key on event silence. A presence sensor in
+   * an empty flat is legitimately silent for many hours (15h, in that
+   * incident), so "no events for N minutes" would rebuild all night for no
+   * reason. Instead the watchdog performs an independent HTTP read every
+   * cycle: it proves the connection can still carry a request, and — because
+   * it re-dispatches the values it read — it also repairs any characteristic
+   * change that a dead event stream silently dropped. `Source.update()` only
+   * emits on real transitions, so re-dispatching identical values is free.
+   *
+   * Only repeated read FAILURES escalate to a full rebuild.
+   */
+  private watchdogTimer?: NodeJS.Timeout;
+  private consecutiveFailures = 0;
+  private rebuildInFlight = false;
+  private static readonly WATCHDOG_INTERVAL_MS = 60_000;
+  private static readonly FAIL_ESCALATE_THRESHOLD = 3;
+
   private readonly pendingSubscribers: Array<{
     matcher: CharacteristicMatcher;
     listener: Listener;
@@ -166,6 +196,7 @@ export class NativeHapBridge extends EventEmitter {
 
   stop(): void {
     this.stopped = true;
+    this.stopWatchdog();
     try {
       this.watchDiscovery?.stop();
     } catch {
@@ -558,7 +589,96 @@ export class NativeHapBridge extends EventEmitter {
     });
 
     this.startConfigWatcher();
+    this.startWatchdog();
     void this.ensureSubscriptionsCurrent();
+  }
+
+  private startWatchdog(): void {
+    if (this.watchdogTimer || this.stopped) {
+      return;
+    }
+    this.watchdogTimer = setInterval(() => {
+      void this.runWatchdog();
+    }, NativeHapBridge.WATCHDOG_INTERVAL_MS);
+    this.watchdogTimer.unref?.();
+  }
+
+  private stopWatchdog(): void {
+    if (this.watchdogTimer) {
+      clearInterval(this.watchdogTimer);
+      this.watchdogTimer = undefined;
+    }
+  }
+
+  /**
+   * One watchdog cycle. Read the catalog over HTTP — independent of the event
+   * stream — and fan the values out, so a wedged event stream degrades to
+   * 60s-polled instead of frozen. Repeated failures mean the connection is
+   * genuinely gone and escalate to {@link rebuildClient}.
+   *
+   * Skipped while a c#-triggered reconcile is running: that path is already
+   * re-fetching and re-subscribing, and two concurrent catalog reads on one
+   * accessory is how you make a flaky FP2 flakier.
+   */
+  private async runWatchdog(): Promise<void> {
+    if (this.stopped || !this.client || this.rebuildInFlight || this.reconcileInFlight) {
+      return;
+    }
+    try {
+      const data = await this.client.getAccessories();
+      const services = this.transformAccessories(data.accessories);
+      this.services = services;
+      for (const svc of services) {
+        for (const ch of svc.serviceCharacteristics) {
+          this.dispatch(svc.aid, ch.iid, ch.value, false);
+        }
+      }
+      this.consecutiveFailures = 0;
+    } catch (err) {
+      this.consecutiveFailures++;
+      this.log.warn(
+        `HAP bridge "${this.config.name}" watchdog read failed `
+          + `(${this.consecutiveFailures}/${NativeHapBridge.FAIL_ESCALATE_THRESHOLD}):`,
+        (err as Error).message,
+      );
+      if (this.consecutiveFailures >= NativeHapBridge.FAIL_ESCALATE_THRESHOLD) {
+        this.consecutiveFailures = 0;
+        await this.rebuildClient("repeated watchdog read failures");
+      }
+    }
+  }
+
+  /**
+   * Full reconnect — the same teardown the `event-disconnect` handler performs,
+   * plus closing the old client so the dead socket does not leak. `bootstrap()`
+   * re-resolves the port via mDNS, so this also recovers the case where the
+   * accessory rebooted onto a new ephemeral HAP port.
+   */
+  private async rebuildClient(reason: string): Promise<void> {
+    if (this.stopped || this.rebuildInFlight) {
+      return;
+    }
+    this.rebuildInFlight = true;
+    this.log.warn(`HAP bridge "${this.config.name}" rebuilding connection (${reason})`);
+    try {
+      try {
+        await this.client?.close();
+      } catch (err) {
+        this.log.debug(
+          `HAP bridge "${this.config.name}" close() during rebuild threw:`,
+          (err as Error).message,
+        );
+      }
+      this.client = undefined;
+      this.discovered = false;
+      this.subscribedKeys.clear();
+      this.markAllDegraded();
+    } finally {
+      this.rebuildInFlight = false;
+    }
+    // Outside the guard: bootstrap() retries until it succeeds, and holding
+    // rebuildInFlight across it would block every later watchdog cycle.
+    await this.bootstrap();
   }
 
   /**
