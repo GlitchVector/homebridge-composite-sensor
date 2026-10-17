@@ -177,6 +177,18 @@ export interface CompositeSensorConfig {
   setOn?: string;
   /** Required when mode === "set-reset". Boolean expression whose rising edge sets state=false. */
   resetOn?: string;
+  /**
+   * Default 0 (set immediately). Only meaningful when mode === "set-reset".
+   *
+   * Dwell requirement for the SET: after `setOn` rises, the state only flips
+   * to true if `setOn` stays true for this many seconds (re-sampled every
+   * 15 s, and aborted at once when a source change makes it false). A
+   * walk-through does not count. Observed 2026-10-17: "CO₂ Alert Present"
+   * (CO₂ alarm AND office/living presence) was set by a 40-second night-time
+   * walk through the office to the bathroom and kept the red alert lamp on
+   * until morning. Reset is unaffected and stays immediate.
+   */
+  setOnStableForSeconds?: number;
 }
 
 /**
@@ -220,6 +232,10 @@ export class CompositeSensor extends EventEmitter {
   private readonly resetTriggerLeaves: { sourceName: string; polarity: "rising" | "falling" }[] = [];
   /** Set-reset mode: last evaluated value of setOn (false/true/undefined for degraded). */
   private setOnLast?: boolean;
+  /** Set-reset mode: dwell required before a set takes effect. Milliseconds. 0 = immediate. */
+  private readonly setStableMs: number;
+  /** Set-reset mode: sampler for a pending dwell-gated set, if any. */
+  private setStableTimer?: NodeJS.Timeout;
   /** Set-reset mode: last per-source values of resetOn refs (for per-source edge detection). */
   private readonly resetSourceLast = new Map<string, boolean | undefined>();
   private pendingDoorCheckTimer?: NodeJS.Timeout;
@@ -277,6 +293,7 @@ export class CompositeSensor extends EventEmitter {
     this.checkAfterMs = Math.max(0, (config.checkAfterMinutes ?? 5) * 60_000);
     this.autoCorrectOnPresence = config.autoCorrectOnPresence ?? true;
     this.stableForMs = Math.max(0, (config.stableForSeconds ?? 0) * 1000);
+    this.setStableMs = Math.max(0, (config.setOnStableForSeconds ?? 0) * 1000);
     this.confirmAfterMs = Math.max(0, (config.confirmAfterMinutes ?? 0) * 60_000);
 
     if (this.mode === "set-reset") {
@@ -642,6 +659,7 @@ export class CompositeSensor extends EventEmitter {
       clearTimeout(this.pendingConfirmTimer);
       this.pendingConfirmTimer = undefined;
     }
+    this.cancelSetStable();
   }
 
   private recompute(): void {
@@ -707,11 +725,63 @@ export class CompositeSensor extends EventEmitter {
     }
     this.setOnLast = setNow;
     if (resetTriggered && resetNow === true) {
+      this.cancelSetStable();
       this.setValue(false);
       return;
     }
-    if (setRose) {
-      this.setValue(true);
+    if (setNow !== true && this.setStableTimer) {
+      this.cancelSetStable();
+      this.platform.log.info(`Sensor "${this.config.name}" set aborted — setOn went false before the dwell elapsed`);
+    }
+    // Already true: a further rising edge is a no-op (used to re-publish and
+    // log "-> true" on every presence blip while the state was already set).
+    if (setRose && !this.currentValue) {
+      if (this.setStableMs === 0) {
+        this.setValue(true);
+      } else {
+        this.startSetStable();
+      }
+    }
+  }
+
+  private evaluateSetOn(): boolean | undefined {
+    const values = new Map<string, boolean | undefined>();
+    for (const name of this.referencedSources) {
+      const src = this.sources.get(name)!;
+      values.set(name, src.degraded ? undefined : src.value);
+    }
+    return evaluate(this.setOnAst!, values);
+  }
+
+  /** Dwell-gated set: sample setOn until the deadline; any false sample aborts. */
+  private startSetStable(): void {
+    if (this.setStableTimer) {
+      return;
+    }
+    const deadline = Date.now() + this.setStableMs;
+    const tick = Math.min(15_000, Math.max(50, Math.floor(this.setStableMs / 4)));
+    this.platform.log.info(
+      `Sensor "${this.config.name}" setOn rose — setting only if it holds for ${this.setStableMs / 1000}s`,
+    );
+    this.setStableTimer = setInterval(() => {
+      if (this.evaluateSetOn() !== true) {
+        this.cancelSetStable();
+        this.platform.log.info(`Sensor "${this.config.name}" set aborted — setOn went false before the dwell elapsed`);
+        return;
+      }
+      if (Date.now() >= deadline) {
+        this.cancelSetStable();
+        if (!this.currentValue) {
+          this.setValue(true);
+        }
+      }
+    }, tick);
+  }
+
+  private cancelSetStable(): void {
+    if (this.setStableTimer) {
+      clearInterval(this.setStableTimer);
+      this.setStableTimer = undefined;
     }
   }
 

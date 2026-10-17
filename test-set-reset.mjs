@@ -253,5 +253,74 @@ function makeSensor(persistDir, opts = {}) {
   fs.rmSync(dir, { recursive: true, force: true });
 }
 
+// S11–S14: setOnStableForSeconds (dwell-gated set, added for "CO₂ Alert Present"
+// after a 40 s night walk-through set it and kept the alert lamp red till morning).
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function makeDwellSensor(dir, stableSeconds) {
+  const co2 = new FakeSource("co2", fakeLog);
+  const office = new FakeSource("office", fakeLog);
+  const sources = new Map([["co2", co2], ["office", office]]);
+  const sensor = new CompositeSensor(makePlatform(dir), fakeAccessory, {
+    name: "CO2 Alert Present", service: "motion", mode: "set-reset",
+    setOn: "co2 AND office", resetOn: "NOT co2", setOnStableForSeconds: stableSeconds,
+  }, sources);
+  co2.push(false); office.push(false);
+  return { sensor, co2, office };
+}
+
+// S11: presence held through the dwell -> set
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "set-reset-s11-"));
+  const { sensor, co2, office } = makeDwellSensor(dir, 0.4);
+  co2.push(true); office.push(true);
+  assertEq("S11a: not set immediately (dwell pending)", sensor["currentValue"], false);
+  await sleep(250);
+  assertEq("S11b: still not set mid-dwell", sensor["currentValue"], false);
+  await sleep(400);
+  assertEq("S11c: set after dwell elapsed", sensor["currentValue"], true);
+  office.push(false);
+  assertEq("S11d: presence leaves -> stays set (sticky until reset)", sensor["currentValue"], true);
+  co2.push(false);
+  assertEq("S11e: CO2 normal -> reset", sensor["currentValue"], false);
+  sensor.stop();
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+// S12: walk-through (presence ends before the dwell) -> never set
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "set-reset-s12-"));
+  const { sensor, co2, office } = makeDwellSensor(dir, 0.4);
+  co2.push(true); office.push(true);
+  await sleep(150);
+  office.push(false);
+  await sleep(500);
+  assertEq("S12: walk-through shorter than dwell -> not set", sensor["currentValue"], false);
+  sensor.stop();
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+// S13: reset during a pending dwell cancels it
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "set-reset-s13-"));
+  const { sensor, co2, office } = makeDwellSensor(dir, 0.4);
+  co2.push(true); office.push(true);
+  await sleep(150);
+  co2.push(false);
+  await sleep(500);
+  assertEq("S13: CO2 normal during dwell -> not set", sensor["currentValue"], false);
+  sensor.stop();
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+// S14: default 0 keeps the old immediate set
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "set-reset-s14-"));
+  const { sensor, co2, office } = makeDwellSensor(dir, 0);
+  co2.push(true); office.push(true);
+  assertEq("S14: setOnStableForSeconds 0 -> immediate set", sensor["currentValue"], true);
+  sensor.stop();
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
 console.log(failed === 0 ? "\nALL SET-RESET TESTS PASSED" : `\n${failed} FAILURE(S)`);
 process.exit(failed === 0 ? 0 : 1);
