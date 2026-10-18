@@ -115,7 +115,10 @@ function makeMagicButton(opts = {}) {
   if (opts.sticky !== undefined) {
     config.sticky = opts.sticky;
   }
-  const mb = new MagicButton(platform, accessory, config, bridges);
+  if (opts.finale !== undefined) {
+    config.finale = opts.finale;
+  }
+  const mb = new MagicButton(platform, accessory, config, bridges, opts.sources ?? new Map());
   return { mb, bridge, accessory, platform };
 }
 
@@ -360,6 +363,67 @@ async function testColorTargetDeactivateRestoresAllChars() {
   );
 }
 
+function fakeSource(value) {
+  return { value, degraded: false };
+}
+
+async function finaleRun(co2AlertValue) {
+  const src = fakeSource(co2AlertValue);
+  const { bridge, accessory } = makeMagicButton({
+    target: { On: true, Brightness: 100, Hue: 0, Saturation: 100 },
+    finale: { target: { Hue: 120 }, seconds: 0.05, when: "NOT co2Alert" },
+    sources: new Map([["co2Alert", src]]),
+  });
+  bridge.push("On", true);
+  bridge.push("Brightness", 7);
+  bridge.push("Hue", 280);
+  bridge.push("Saturation", 92);
+  await getOnHandler(accessory)(true);
+  bridge.clear();
+  await getOnHandler(accessory)(false);
+  return bridge.writes;
+}
+
+async function testFinaleFlashesWhenAlarmEnded() {
+  assertEq(
+    "finale: alarm ended -> green first, then restore",
+    await finaleRun(false),
+    [
+      { char: "Hue", value: 120 },
+      { char: "Brightness", value: 7 },
+      { char: "Hue", value: 280 },
+      { char: "Saturation", value: 92 },
+      { char: "On", value: true },
+    ],
+  );
+}
+
+async function testFinaleSkippedWhenOnlyPresenceLeft() {
+  assertEq(
+    "finale: alarm still on (presence left) -> plain restore",
+    await finaleRun(true),
+    [
+      { char: "Brightness", value: 7 },
+      { char: "Hue", value: 280 },
+      { char: "Saturation", value: 92 },
+      { char: "On", value: true },
+    ],
+  );
+}
+
+async function testFinaleRejectsUnknownSource() {
+  let threw = false;
+  try {
+    makeMagicButton({
+      target: { On: true },
+      finale: { target: { Hue: 120 }, seconds: 1, when: "nope" },
+    });
+  } catch {
+    threw = true;
+  }
+  assertEq("finale: unknown source in `when` rejected", threw, true);
+}
+
 async function testColorTargetManualHueChangeDoesNotAutoOff() {
   const { bridge, accessory } = makeMagicButton({
     target: { On: true, Brightness: 100, Hue: 120, Saturation: 100 },
@@ -583,6 +647,9 @@ async function testConfigValidatesBridgeExists() {
   await testConfigRejectsEmptyTarget();
   await testConfigRejectsNeither();
   await testConfigValidatesBridgeExists();
+  await testFinaleFlashesWhenAlarmEnded();
+  await testFinaleSkippedWhenOnlyPresenceLeft();
+  await testFinaleRejectsUnknownSource();
 
   if (failed > 0) {
     console.log(`\n${failed} test(s) FAILED`);

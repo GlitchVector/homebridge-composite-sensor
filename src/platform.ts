@@ -291,7 +291,7 @@ export class CompositeSensorPlatform implements DynamicPlatformPlugin {
           ));
         } else if (sensorConfig.service === "magic_button") {
           this.sensors.push(new MagicButton(
-            this, accessory, sensorConfig as MagicButtonConfig, this.hapBridges,
+            this, accessory, sensorConfig as MagicButtonConfig, this.hapBridges, this.sources,
           ));
         } else {
           const composite = new CompositeSensor(

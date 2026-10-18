@@ -1,6 +1,8 @@
 import { CharacteristicValue, PlatformAccessory, Service } from "homebridge";
 import { HapBridge } from "../sources/hapBridge.js";
 import { CompositeSensorPlatform } from "../platform.js";
+import { Source } from "../sources/source.js";
+import { Ast, collectIdentifiers, evaluate, parseExpression } from "../dsl/parser.js";
 
 type CharValue = boolean | number | string;
 
@@ -65,6 +67,15 @@ export interface MagicButtonConfig {
    * sticky only controls whether the auto-OFF heuristic runs.
    */
   sticky?: boolean;
+  /**
+   * Optional "all clear" flash on deactivation: when `when` (an expression
+   * over sources, like a sensor's `expression`) is true at the moment the
+   * switch goes OFF, write `target` first, hold it `seconds`, then restore
+   * the snapshot. If `when` is false/unknown, restore immediately. Used by
+   * the CO₂ lamp: red goes green for a few seconds when the alarm ENDS, but
+   * not when the red only ends because nobody is in the room any more.
+   */
+  finale?: { target: Record<string, CharValue>; seconds: number; when: string };
 }
 
 interface Snapshot {
@@ -110,12 +121,15 @@ export class MagicButton {
   /** Fallback timer that enables manualWatchEnabled if the write echo never arrives. */
   private manualWatchTimer?: ReturnType<typeof setTimeout>;
   private static readonly MANUAL_WATCH_FALLBACK_MS = 3000;
+  private readonly finaleAst?: Ast;
+  private readonly finaleRefs: string[] = [];
 
   constructor(
     private readonly platform: CompositeSensorPlatform,
     accessory: PlatformAccessory,
     private readonly config: MagicButtonConfig,
     bridges: Map<string, HapBridge>,
+    private readonly sources: Map<string, Source> = new Map(),
   ) {
     accessory.getService(platform.Service.AccessoryInformation)
       ?.setCharacteristic(platform.Characteristic.Manufacturer, "homebridge-composite-sensor")
@@ -140,6 +154,16 @@ export class MagicButton {
     this.bridge = bridge;
 
     this.target = this.resolveTarget(config);
+
+    if (config.finale) {
+      this.finaleAst = parseExpression(config.finale.when);
+      for (const id of collectIdentifiers(this.finaleAst)) {
+        if (!this.sources.has(id)) {
+          throw new Error(`Magic button "${config.name}" finale references unknown source "${id}"`);
+        }
+        this.finaleRefs.push(id);
+      }
+    }
 
     // Subscribe to every characteristic we'll snapshot+write, so we always
     // have a current value cached when the user toggles the switch.
@@ -340,6 +364,18 @@ export class MagicButton {
     }
     const snap = this.snapshot.values;
     this.snapshot = undefined;
+
+    const finale = this.config.finale;
+    if (finale && this.finaleAst && this.finaleWhen() === true) {
+      this.platform.log.info(
+        `Magic button "${this.config.name}" finale: ${JSON.stringify(finale.target)} for ${finale.seconds}s`,
+      );
+      for (const [char, value] of Object.entries(finale.target)) {
+        await this.bridge.write({ accessory: this.config.accessory, characteristic: char }, value);
+      }
+      await new Promise((r) => setTimeout(r, Math.max(0, finale.seconds) * 1000));
+    }
+
     this.platform.log.info(
       `Magic button "${this.config.name}" deactivate: restore ${JSON.stringify(snap)}`,
     );
@@ -361,6 +397,15 @@ export class MagicButton {
         snap.On,
       );
     }
+  }
+
+  private finaleWhen(): boolean | undefined {
+    const values = new Map<string, boolean | undefined>();
+    for (const id of this.finaleRefs) {
+      const src = this.sources.get(id)!;
+      values.set(id, src.degraded ? undefined : src.value);
+    }
+    return evaluate(this.finaleAst!, values);
   }
 
   /**
