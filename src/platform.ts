@@ -22,6 +22,7 @@ import { LightSensor, LightSensorConfig } from "./sensors/lightSensor.js";
 import { CountSensor, CountSensorConfig } from "./sensors/countSensor.js";
 import { DurationSensor, DurationSensorConfig } from "./sensors/durationSensor.js";
 import { MagicButton, MagicButtonConfig } from "./sensors/magicButton.js";
+import { Router, RouterConfig } from "./sensors/router.js";
 
 type SourceConfig = MqttSourceConfig | HapSourceConfig;
 type SensorConfig =
@@ -29,7 +30,8 @@ type SensorConfig =
   | LightSensorConfig
   | CountSensorConfig
   | DurationSensorConfig
-  | MagicButtonConfig;
+  | MagicButtonConfig
+  | RouterConfig;
 
 interface CompositeSensorPlatformConfig extends PlatformConfig {
   mqtt?: MqttConfig;
@@ -237,6 +239,13 @@ export class CompositeSensorPlatform implements DynamicPlatformPlugin {
           );
           continue;
         }
+      } else if (sensorConfig.service === "router") {
+        const cfg = sensorConfig as RouterConfig;
+        if (!Array.isArray(cfg.routes) || cfg.routes.length === 0
+            || cfg.routes.some((r) => !r || !r.when || !r.target)) {
+          this.log.error(`router "${sensorConfig.name}" requires routes[] of { when, target }`);
+          continue;
+        }
       } else if (sensorConfig.service === "magic_button") {
         const cfg = sensorConfig as MagicButtonConfig;
         if (!cfg.bridge || cfg.accessory === undefined
@@ -288,6 +297,10 @@ export class CompositeSensorPlatform implements DynamicPlatformPlugin {
         } else if (sensorConfig.service === "duration") {
           this.sensors.push(new DurationSensor(
             this, accessory, sensorConfig as DurationSensorConfig, this.sources,
+          ));
+        } else if (sensorConfig.service === "router") {
+          this.sensors.push(new Router(
+            this, accessory, sensorConfig as RouterConfig, this.sources,
           ));
         } else if (sensorConfig.service === "magic_button") {
           this.sensors.push(new MagicButton(
