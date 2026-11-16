@@ -216,6 +216,10 @@ export class CompositeSensor extends EventEmitter {
   private readonly stableForMs: number;
   /** Last value observed on `doorSource` (undefined if never observed a non-degraded value). */
   private lastDoorValue: boolean | undefined = undefined;
+  /** Last `degraded` flag observed on `doorSource`. Sources start degraded. */
+  private lastDoorDegraded = true;
+  /** True once `doorSource` has been healthy at least once in this process. */
+  private doorHealthySeen = false;
   /** Cancel flag for the currently-running sustained-true validation, if any. */
   private sustainedCheckCancel?: { cancelled: boolean };
   /** Set-reset mode: rising edge sets state=true. */
@@ -870,7 +874,25 @@ export class CompositeSensor extends EventEmitter {
     const prev = this.lastDoorValue;
     const curr = this.doorSource?.value;
     this.lastDoorValue = curr;
+    // Track door-source health. A degraded→healthy transition AFTER the
+    // source has been healthy once means the door feed was down for a while
+    // (broker restart, zigbee2mqtt restart, network). Any crossing in that
+    // gap was lost — observed 2026-10-23: the occupant left during an 8-min
+    // z2m+mosquitto restart, no door event ever arrived, and the state
+    // stayed `home` for 23h in an empty flat. The startup emit
+    // (never-healthy → healthy) is NOT a recovery.
+    const wasDegraded = this.lastDoorDegraded;
+    const degradedNow = this.doorSource?.degraded ?? true;
+    this.lastDoorDegraded = degradedNow;
+    const recovered = wasDegraded && !degradedNow && this.doorHealthySeen;
+    if (!degradedNow) {
+      this.doorHealthySeen = true;
+    }
     if (prev === undefined || curr === undefined || prev === curr) {
+      if (recovered) {
+        this.onDoorFeedRecovered();
+        return;
+      }
       this.platform.log.debug(
         `Sensor "${this.config.name}" door source change ignored (prev=${prev}, curr=${curr}) — not a real transition`,
       );
@@ -891,6 +913,29 @@ export class CompositeSensor extends EventEmitter {
       );
       this.setValue(true);
     }
+    this.scheduleDoorCheck("door event");
+  }
+
+  /**
+   * The door feed came back after an outage. A crossing may have been lost,
+   * so treat it like a door event, but WITHOUT rule 5: nothing says someone
+   * came in, so state is not flipped to `home` up front. The +N check (with
+   * sustained-true validation and the confirmation re-check) decides from
+   * the presence expression, exactly as after a real door event.
+   */
+  private onDoorFeedRecovered(): void {
+    if (this.sustainedCheckCancel) {
+      this.sustainedCheckCancel.cancelled = true;
+      this.sustainedCheckCancel = undefined;
+    }
+    this.cancelConfirmCheck("door feed recovered");
+    this.platform.log.info(
+      `Sensor "${this.config.name}" door feed recovered after an outage — a crossing may have been missed`,
+    );
+    this.scheduleDoorCheck("door feed recovered");
+  }
+
+  private scheduleDoorCheck(reason: string): void {
     if (this.pendingDoorCheckTimer) {
       clearTimeout(this.pendingDoorCheckTimer);
       this.pendingDoorCheckTimer = undefined;
@@ -904,7 +949,7 @@ export class CompositeSensor extends EventEmitter {
     this.pendingDoorCheckAt = Date.now() + this.checkAfterMs;
     this.persistState();
     this.platform.log.info(
-      `Sensor "${this.config.name}" door event — scheduled check in ${this.checkAfterMs / 60_000}min`,
+      `Sensor "${this.config.name}" ${reason} — scheduled check in ${this.checkAfterMs / 60_000}min`,
     );
     this.pendingDoorCheckTimer = setTimeout(() => {
       this.pendingDoorCheckTimer = undefined;

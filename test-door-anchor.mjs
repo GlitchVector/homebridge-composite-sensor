@@ -74,6 +74,7 @@ async function run() {
       autoCorrectOnPresence: false, // isolate rule 2+3, no rule-4 interference
       onDegraded: "lastKnown",
     }, sources);
+    if (typeof door !== "undefined") door.push(false); // startup emit (ignored since 0.9.2)
     expect("D1a: cold-start defaults to home (per design)", sensor["currentValue"], true);
     fp2.push(true);
     door.push(true);
@@ -96,6 +97,7 @@ async function run() {
       checkAfterMinutes: 0.05 / 60,
       autoCorrectOnPresence: false,
     }, sources);
+    if (typeof door !== "undefined") door.push(false); // startup emit (ignored since 0.9.2)
     sensor["currentValue"] = false; // simulate prior away state, force the path under test
     fp2.push(true);
     door.push(true);
@@ -121,6 +123,7 @@ async function run() {
       expression: "fp2",
       checkAfterMinutes: 0.05 / 60,
     }, sources);
+    if (typeof door !== "undefined") door.push(false); // startup emit (ignored since 0.9.2)
     fp2.push(true);
     sensor["currentValue"] = true; // pretend we were home
     fp2.push(false);
@@ -143,6 +146,7 @@ async function run() {
       expression: "fp2",
       checkAfterMinutes: 1, // long enough that no check fires during this test
     }, sources);
+    if (typeof door !== "undefined") door.push(false); // startup emit (ignored since 0.9.2)
     sensor["currentValue"] = true; // pretend home
     fp2.push(true);
     fp2.push(false);  // bathroom / sleep — FP2 silence
@@ -166,6 +170,7 @@ async function run() {
       checkAfterMinutes: 0.05 / 60,
       autoCorrectOnPresence: true,
     }, sources);
+    if (typeof door !== "undefined") door.push(false); // startup emit (ignored since 0.9.2)
     fp2.push(false);
     door.push(true);
     await sleep(80);
@@ -189,6 +194,7 @@ async function run() {
       checkAfterMinutes: 0.05 / 60,
       autoCorrectOnPresence: false,
     }, sources);
+    if (typeof door !== "undefined") door.push(false); // startup emit (ignored since 0.9.2)
     fp2.push(false);
     door.push(true);
     await sleep(80);
@@ -211,6 +217,7 @@ async function run() {
       expression: "fp2",
       checkAfterMinutes: 0.05 / 60,
     }, sources);
+    if (typeof door !== "undefined") door.push(false); // startup emit (ignored since 0.9.2)
     sensor["currentValue"] = true;
     fp2.push(false);
     door.push(true);          // schedules check #1 in 50ms
@@ -237,6 +244,7 @@ async function run() {
     }, sources_1);
     sensor_1["currentValue"] = true;
     fp2_1.push(true);
+    door_1.push(false); // startup emit (ignored since 0.9.2)
     door_1.push(true);  // schedules check ~60s out — persisted
     sensor_1.stop();
     const file = path.join(persistDir, "composite-sensor-test-d7.json");
@@ -277,6 +285,7 @@ async function run() {
         expression: "fp2",
         // no doorSource
       }, sources);
+    if (typeof door !== "undefined") door.push(false); // startup emit (ignored since 0.9.2)
     } catch {
       threw = true;
     }
@@ -303,6 +312,7 @@ async function run() {
       checkAfterMinutes: 0.05 / 60,
       onDegraded: "false",
     }, sources);
+    if (typeof door !== "undefined") door.push(false); // startup emit (ignored since 0.9.2)
     sensor["currentValue"] = true;     // pretend we were home
     sensor["lastKnown"] = true;
     sensor["hasSeenAnyValue"] = true;
@@ -331,6 +341,7 @@ async function run() {
       checkAfterMinutes: 0.05 / 60,
       onDegraded: "false",
     }, sources);
+    if (typeof door !== "undefined") door.push(false); // startup emit (ignored since 0.9.2)
     sensor["currentValue"] = false;
     office.push(true);                 // someone in office
     couch.push(undefined, true);       // livingroom branch degraded
@@ -357,6 +368,7 @@ async function run() {
       checkAfterMinutes: 0.05 / 60,
       autoCorrectOnPresence: false,  // isolate rule 5 from rule 4
     }, sources);
+    if (typeof door !== "undefined") door.push(false); // startup emit (ignored since 0.9.2)
     sensor["currentValue"] = false;  // simulate prior away state
     fp2.push(true);                  // user just entered the hallway
     door.push(true);
@@ -382,6 +394,7 @@ async function run() {
       checkAfterMinutes: 0.05 / 60,
       autoCorrectOnPresence: false,
     }, sources);
+    if (typeof door !== "undefined") door.push(false); // startup emit (ignored since 0.9.2)
     sensor["currentValue"] = false;
     fp2.push(false);                 // no one actually entered
     door.push(true);
@@ -408,12 +421,88 @@ async function run() {
       checkAfterMinutes: 0.05 / 60,
       autoCorrectOnPresence: false,
     }, sources);
+    if (typeof door !== "undefined") door.push(false); // startup emit (ignored since 0.9.2)
     sensor["currentValue"] = true;
     fp2.push(false);                 // user is leaving
     door.push(true);
     expect("D12d-a: door-while-home stays home synchronously", sensor["currentValue"], true);
     await sleep(80);
     expect("D12d-b: +N check sees FP2 silent → flip to away (rule 2 unchanged)", sensor["currentValue"], false);
+    sensor.stop();
+  }
+
+  // --- D13: door feed outage, crossing lost (2026-10-23) → recovery check → away ---
+  {
+    const fp2 = new FakeSource("fp2", fakeLog);
+    const door = new FakeSource("door", fakeLog);
+    const sources = new Map([["fp2", fp2], ["door", door]]);
+    const sensor = new CompositeSensor(platform, fakeAccessory, {
+      name: "Test D13",
+      service: "occupancy",
+      mode: "door-anchor",
+      doorSource: "door",
+      expression: "fp2",
+      checkAfterMinutes: 0.05 / 60,
+    }, sources);
+    if (typeof door !== "undefined") door.push(false); // startup emit (ignored since 0.9.2)
+    fp2.push(true);
+    door.push(false);          // startup emit, healthy
+    await sleep(10);
+    sensor["currentValue"] = true;
+    door.push(false, true);    // broker/z2m down: same value, degraded
+    fp2.push(false);           // occupant leaves during the outage; door event lost
+    await sleep(80);
+    expect("D13a: outage alone does not change state", sensor["currentValue"], true);
+    door.push(false, false);   // feed back, same closed value
+    expect("D13b: recovery does NOT flip to home/away instantly (no rule 5)", sensor["currentValue"], true);
+    await sleep(80);
+    expect("D13c: recovery check with FP2 silent → away", sensor["currentValue"], false);
+    sensor.stop();
+  }
+
+  // --- D14: feed recovers while someone is home and moving → stays home ---
+  {
+    const fp2 = new FakeSource("fp2", fakeLog);
+    const door = new FakeSource("door", fakeLog);
+    const sources = new Map([["fp2", fp2], ["door", door]]);
+    const sensor = new CompositeSensor(platform, fakeAccessory, {
+      name: "Test D14",
+      service: "occupancy",
+      mode: "door-anchor",
+      doorSource: "door",
+      expression: "fp2",
+      checkAfterMinutes: 0.05 / 60,
+    }, sources);
+    if (typeof door !== "undefined") door.push(false); // startup emit (ignored since 0.9.2)
+    fp2.push(true);
+    door.push(false);
+    await sleep(10);
+    door.push(false, true);
+    door.push(false, false);
+    await sleep(80);
+    expect("D14: recovery check with FP2 active → home", sensor["currentValue"], true);
+    sensor.stop();
+  }
+
+  // --- D15: startup (never-healthy → healthy) is NOT a recovery ---
+  {
+    const fp2 = new FakeSource("fp2", fakeLog);
+    const door = new FakeSource("door", fakeLog);
+    const sources = new Map([["fp2", fp2], ["door", door]]);
+    const sensor = new CompositeSensor(platform, fakeAccessory, {
+      name: "Test D15",
+      service: "occupancy",
+      mode: "door-anchor",
+      doorSource: "door",
+      expression: "fp2",
+      checkAfterMinutes: 0.05 / 60,
+    }, sources);
+    if (typeof door !== "undefined") door.push(false); // startup emit (ignored since 0.9.2)
+    fp2.push(false);
+    door.push(false);          // first healthy emit at startup
+    await sleep(80);
+    expect("D15: startup emit schedules no check (stays home with FP2 silent)", sensor["currentValue"], true);
+    expect("D15b: no pending check", sensor["pendingDoorCheckAt"], undefined);
     sensor.stop();
   }
 
@@ -430,6 +519,7 @@ async function run() {
         doorSource: "nonexistent",
         expression: "fp2",
       }, sources);
+    if (typeof door !== "undefined") door.push(false); // startup emit (ignored since 0.9.2)
     } catch {
       threw = true;
     }

@@ -73,6 +73,19 @@
               "description": "JS expression over `payload` (parsed JSON) and `raw` (string) that coerces to a boolean.",
               "condition": { "functionBody": "return model.sources && model.sources[arrayIndices[0]] && model.sources[arrayIndices[0]].type === 'mqtt';" }
             },
+            "availabilityTopic": {
+              "title": "MQTT availability topic (optional)",
+              "type": "string",
+              "placeholder": "zigbee2mqtt/bridge/state",
+              "description": "Topic that reports whether the publisher is alive. While it reports offline the source is degraded; a door-anchor door source re-checks presence when it comes back, since a crossing may have been missed.",
+              "condition": { "functionBody": "return model.sources && model.sources[arrayIndices[0]] && model.sources[arrayIndices[0]].type === 'mqtt';" }
+            },
+            "availabilityMap": {
+              "title": "Availability map expression (optional)",
+              "type": "string",
+              "placeholder": "payload?.state === \"online\" || raw === \"online\"",
+              "condition": { "functionBody": "return model.sources && model.sources[arrayIndices[0]] && model.sources[arrayIndices[0]].type === 'mqtt';" }
+            },
             "bridge": {
               "title": "HAP bridge name",
               "type": "string",
